@@ -64,15 +64,6 @@ class UsageError(Exception):
 
 _preinit = []
 
-default_plugins = (
-     "mark main terminal runner python fixtures debugging unittest capture skipping "
-     "tmpdir monkeypatch recwarn pastebin helpconfig nose assertion "
-     "junitxml resultlog doctest cacheprovider freeze_support "
-     "setuponly setupplan").split()
-
-builtin_plugins = set(default_plugins)
-builtin_plugins.add("pytester")
-
 
 def _preloadplugins():
     assert not _preinit
@@ -84,8 +75,7 @@ def get_config():
     # subsequent calls to main will create a fresh instance
     pluginmanager = PytestPluginManager()
     config = Config(pluginmanager)
-    for spec in default_plugins:
-        pluginmanager.import_plugin(spec)
+    pluginmanager.load_setuptools_entrypoints('pytest.initial_plugins')
     return config
 
 def get_plugin_manager():
@@ -392,12 +382,14 @@ class PytestPluginManager(PluginManager):
         assert isinstance(modname, str)
         if self.get_plugin(modname) is not None:
             return
-        if modname in builtin_plugins:
-            importspec = "_pytest." + modname
-        else:
-            importspec = modname
+        entry = pkg_resources.get_entry_info('pytest', 'pytest.builtin_plugins', modname)
+
+
         try:
-            __import__(importspec)
+            if entry is not None:
+                mod = entry.load()
+            else:
+                mod = __import__(modname, from_list=['*'])
         except ImportError as e:
             new_exc = ImportError('Error importing plugin "%s": %s' % (modname, e))
             # copy over name and path attributes
@@ -411,7 +403,6 @@ class PytestPluginManager(PluginManager):
                 raise
             self._warn("skipped plugin %r: %s" %((modname, e.msg)))
         else:
-            mod = sys.modules[importspec]
             self.register(mod, modname)
             self.consider_module(mod)
 

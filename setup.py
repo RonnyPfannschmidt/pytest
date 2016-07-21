@@ -15,6 +15,20 @@ classifiers = ['Development Status :: 6 - Mature',
               ('Programming Language :: Python :: %s' % x) for x in
                   '2 2.6 2.7 3 3.3 3.4 3.5'.split()]
 
+initial_plugins = (
+    "mark", "main", "terminal", "runner", "python",
+    "fixtures", "debugging", "unittest", "capture",
+    "skipping", "tmpdir", "monkeypatch", "recwarn",
+    "pastebin", "helpconfig", "nose", "assertion",
+    "junitxml", "resultlog", "doctest", "cacheprovider",
+    "freeze_support", "setuponly", "setupplan",
+)
+builtin_plugins = initial_plugins + ('pytester',)
+
+def plugins(elements):
+    return ["{name} = _pytest.{name}".format(name=name) for name in elements]
+
+
 with open('README.rst') as fd:
     long_description = fd.read()
 
@@ -69,8 +83,11 @@ def main():
         platforms=['unix', 'linux', 'osx', 'cygwin', 'win32'],
         author='Holger Krekel, Bruno Oliveira, Ronny Pfannschmidt, Floris Bruynooghe, Brianna Laugher, Florian Bruhin and others',
         author_email='holger at merlinux.eu',
-        entry_points={'console_scripts':
-                          ['pytest=pytest:main', 'py.test=pytest:main']},
+        entry_points={
+            'console_scripts': ['pytest=pytest:main', 'py.test=pytest:main'],
+            'pytest.initial_plugins': plugins(initial_plugins),
+            'pytest.builtin_plugins': plugins(builtin_plugins),
+        },
         classifiers=classifiers,
         cmdclass={'test': PyTest},
         # the following should be enabled for release
