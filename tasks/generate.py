@@ -96,7 +96,7 @@ def devpi_upload(ctx, version, user, password=None):
                 '(if not given assumed logged in)',
 })
 def pre_release(ctx, version, user, password=None):
-    """Generates new docs, release announcements and uploads a new release to devpi for testing."""    
+    """Generates new docs, release announcements and uploads a new release to devpi for testing."""
     announce(ctx, version)
     regen(ctx)
 
@@ -146,3 +146,17 @@ def publish_release(ctx, version, user, pypi_name):
     print(' ', ','.join(emails))
     print()
     print('And announce it on twitter adding the #pytest hash tag.')
+
+
+@invoke.task(help={
+    'version': 'version being released',
+})
+def changelog_draft(ctx, version):
+    check_call(['towncrier', '--draft', '--version', version])
+
+
+@invoke.task(help={
+    'version': 'version being released',
+})
+def changelog_update(ctx, version):
+    check_call(['towncrier', '--version', version])
