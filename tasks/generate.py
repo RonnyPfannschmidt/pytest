@@ -153,5 +153,9 @@ def publish_release(ctx, version, user, pypi_name):
     'write_out': 'write changes to the actial changelog'
 })
 def changelog(ctx, version, write_out=False):
-    check_call(['towncrier', '--draft', '--version', version])
+    if write_out:
+        addopts = []
+    else:
+        addopts = ['--draft']
+    check_call(['towncrier', '--version', version] + addopts)
 
