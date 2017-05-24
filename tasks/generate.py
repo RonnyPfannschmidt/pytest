@@ -99,6 +99,7 @@ def pre_release(ctx, version, user, password=None):
     """Generates new docs, release announcements and uploads a new release to devpi for testing."""
     announce(ctx, version)
     regen(ctx)
+    changelog(ctx, version, write_out=True)
 
     msg = 'Preparing release version {}'.format(version)
     check_call(['git', 'commit', '-a', '-m', msg])
