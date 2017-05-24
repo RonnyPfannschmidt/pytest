@@ -1,12 +1,12 @@
 [tool.towncrier]
 package = "pytest"
 filename = "CHANGELOG.rst"
-directory = "news/"
+directory = "changelog/"
 title_format = """
 {version} ({project_date})
 ==================
 """
-template = "news/_template.rst"
+template = "changelog/_template.rst"
 
   [[tool.towncrier.type]]
   directory = "removal"
