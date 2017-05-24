@@ -150,13 +150,8 @@ def publish_release(ctx, version, user, pypi_name):
 
 @invoke.task(help={
     'version': 'version being released',
+    'write_out': 'write changes to the actial changelog'
 })
-def changelog_draft(ctx, version):
+def changelog(ctx, version, write_out=False):
     check_call(['towncrier', '--draft', '--version', version])
 
-
-@invoke.task(help={
-    'version': 'version being released',
-})
-def changelog_update(ctx, version):
-    check_call(['towncrier', '--version', version])
