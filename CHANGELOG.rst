@@ -6,8 +6,21 @@
     https://pip.pypa.io/en/latest/development/#adding-a-news-entry
     we named the news folder changelog
 
-
 .. towncrier release notes start
+
+Pytest 3.1.1.dev25+g721df20.d20170530 (2017-05-30)
+==================================================
+
+Bug Fixes
+---------
+
+- Fix issue with non-ascii contents in doctest text files. (#2434)
+- Fix encoding errors for unicode warnings in Python 2. (#2436)
+
+Improved Documentation
+----------------------
+
+- initial addition of towncrier (#2390)
 
 
 3.1.0 (2017-05-22)
