@@ -2,10 +2,6 @@
 package = "pytest"
 filename = "CHANGELOG.rst"
 directory = "changelog/"
-title_format = """
-{version} ({project_date})
-==================
-"""
 template = "changelog/_template.rst"
 
   [[tool.towncrier.type]]
