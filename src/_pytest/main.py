@@ -298,7 +298,9 @@ def pytest_collection_modifyitems(items, config):
             remaining.append(colitem)
 
     if deselected:
-        config.hook.pytest_deselected(items=deselected)
+        config.hook.pytest_deselected2(
+            items=deselected, reason="deselect_prefixes({})".format(deselect_prefixes)
+        )
         items[:] = remaining
 
 

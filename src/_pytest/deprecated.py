@@ -75,3 +75,7 @@ PYTEST_PLUGINS_FROM_NON_TOP_LEVEL_CONFTEST = RemovedInPytest4Warning(
 PYTEST_NAMESPACE = RemovedInPytest4Warning(
     "pytest_namespace is deprecated and will be removed soon"
 )
+
+PYTEST_DESELECTED = RemovedInPytest4Warning(
+    "pytest_deselected is replaced with pytest_deselected2"
+)

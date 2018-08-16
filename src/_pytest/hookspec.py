@@ -1,7 +1,7 @@
 """ hook specifications for pytest plugins, invoked from main.py and builtin plugins.  """
 
 from pluggy import HookspecMarker
-from .deprecated import PYTEST_NAMESPACE
+from .deprecated import PYTEST_NAMESPACE, PYTEST_DESELECTED
 
 
 hookspec = HookspecMarker("pytest")
@@ -252,8 +252,13 @@ def pytest_collectreport(report):
     """ collector finished collecting. """
 
 
+@hookspec(warn_on_impl=PYTEST_DESELECTED)
 def pytest_deselected(items):
     """ called for test items deselected by keyword. """
+
+
+def pytest_deselected2(items, reason):
+    """ called for test items deselected by keyword for a reason. """
 
 
 @hookspec(firstresult=True)

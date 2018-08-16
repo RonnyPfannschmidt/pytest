@@ -129,7 +129,9 @@ def deselect_by_keyword(items, config):
             remaining.append(colitem)
 
     if deselected:
-        config.hook.pytest_deselected(items=deselected)
+        config.hook.pytest_deselected2(
+            items=deselected, reason="keywordexpr({})".format(keywordexpr)
+        )
         items[:] = remaining
 
 
@@ -147,7 +149,9 @@ def deselect_by_mark(items, config):
             deselected.append(item)
 
     if deselected:
-        config.hook.pytest_deselected(items=deselected)
+        config.hook.pytest_deselected2(
+            items=deselected, reason="markexpr({})".format(matchexpr)
+        )
         items[:] = remaining
 
 

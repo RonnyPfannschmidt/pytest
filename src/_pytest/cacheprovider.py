@@ -177,11 +177,13 @@ class LFPlugin(object):
                     return
                 if self.config.getoption("lf"):
                     items[:] = previously_failed
-                    config.hook.pytest_deselected(items=previously_passed)
+                    config.hook.pytest_deselected2(
+                        items=previously_passed, reason="previously passed"
+                    )
                 else:
                     items[:] = previously_failed + previously_passed
             elif self._no_failures_behavior == "none":
-                config.hook.pytest_deselected(items=items)
+                config.hook.pytest_deselected2(items=items, reason="previously passed")
                 items[:] = []
 
     def pytest_sessionfinish(self, session):

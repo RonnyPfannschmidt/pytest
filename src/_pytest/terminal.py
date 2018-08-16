@@ -342,7 +342,7 @@ class TerminalReporter(object):
             #     which garbles our output if we use self.write_line
             self.write_line(msg)
 
-    def pytest_deselected(self, items):
+    def pytest_deselected2(self, items):
         self.stats.setdefault("deselected", []).extend(items)
 
     def pytest_runtest_logstart(self, nodeid, location):
