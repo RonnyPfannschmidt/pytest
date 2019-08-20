@@ -57,7 +57,7 @@ is that you can use print statements for debugging:
 
 
     def setup_function(function):
-        print("setting up %s" % function)
+        print("setting up", function)
 
 
     def test_func1():
@@ -88,10 +88,10 @@ of the failing function and hide the other one:
     >       assert False
     E       assert False
 
-    test_module.py:9: AssertionError
+    test_module.py:12: AssertionError
     -------------------------- Captured stdout setup ---------------------------
     setting up <function test_func2 at 0xdeadbeef>
-    ==================== 1 failed, 1 passed in 0.12 seconds ====================
+    ======================= 1 failed, 1 passed in 0.05s ========================
 
 Accessing captured output from a test function
 ---------------------------------------------------

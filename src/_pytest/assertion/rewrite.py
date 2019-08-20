@@ -854,10 +854,7 @@ class AssertionRewriter(ast.NodeVisitor):
         internally already.
         See issue #3191 for more details.
         """
-
-        # Using parse because it is different between py2 and py3.
-        AST_NONE = ast.parse("None").body[0].value
-        val_is_none = ast.Compare(node, [ast.Is()], [AST_NONE])
+        val_is_none = ast.Compare(node, [ast.Is()], [ast.NameConstant(None)])
         send_warning = ast.parse(
             """\
 from _pytest.warning_types import PytestAssertRewriteWarning

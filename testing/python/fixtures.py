@@ -7,40 +7,79 @@ from _pytest.fixtures import FixtureLookupError
 from _pytest.fixtures import FixtureRequest
 from _pytest.pathlib import Path
 from _pytest.pytester import get_public_names
-from _pytest.warnings import SHOW_PYTEST_WARNINGS_ARG
 
 
-def test_getfuncargnames():
+def test_getfuncargnames_functions():
+    """Test getfuncargnames for normal functions"""
+
     def f():
-        pass
+        raise NotImplementedError()
 
     assert not fixtures.getfuncargnames(f)
 
     def g(arg):
-        pass
+        raise NotImplementedError()
 
     assert fixtures.getfuncargnames(g) == ("arg",)
 
     def h(arg1, arg2="hello"):
-        pass
+        raise NotImplementedError()
 
     assert fixtures.getfuncargnames(h) == ("arg1",)
 
     def j(arg1, arg2, arg3="hello"):
-        pass
+        raise NotImplementedError()
 
     assert fixtures.getfuncargnames(j) == ("arg1", "arg2")
 
+
+def test_getfuncargnames_methods():
+    """Test getfuncargnames for normal methods"""
+
     class A:
         def f(self, arg1, arg2="hello"):
-            pass
-
-        @staticmethod
-        def static(arg1, arg2):
-            pass
+            raise NotImplementedError()
 
     assert fixtures.getfuncargnames(A().f) == ("arg1",)
+
+
+def test_getfuncargnames_staticmethod():
+    """Test getfuncargnames for staticmethods"""
+
+    class A:
+        @staticmethod
+        def static(arg1, arg2, x=1):
+            raise NotImplementedError()
+
     assert fixtures.getfuncargnames(A.static, cls=A) == ("arg1", "arg2")
+
+
+def test_getfuncargnames_partial():
+    """Check getfuncargnames for methods defined with functools.partial (#5701)"""
+    import functools
+
+    def check(arg1, arg2, i):
+        raise NotImplementedError()
+
+    class T:
+        test_ok = functools.partial(check, i=2)
+
+    values = fixtures.getfuncargnames(T().test_ok, name="test_ok")
+    assert values == ("arg1", "arg2")
+
+
+def test_getfuncargnames_staticmethod_partial():
+    """Check getfuncargnames for staticmethods defined with functools.partial (#5701)"""
+    import functools
+
+    def check(arg1, arg2, i):
+        raise NotImplementedError()
+
+    class T:
+        test_ok = staticmethod(functools.partial(check, i=2))
+
+    values = fixtures.getfuncargnames(T().test_ok, name="test_ok")
+    assert values == ("arg1", "arg2")
 
 
 @pytest.mark.pytester_example_path("fixtures/fill_fixtures")
@@ -599,8 +638,7 @@ class TestRequestBasic:
         result = testdir.runpytest()
         result.stdout.fnmatch_lines(["* 2 passed in *"])
 
-    @pytest.mark.parametrize("getfixmethod", ("getfixturevalue", "getfuncargvalue"))
-    def test_getfixturevalue(self, testdir, getfixmethod):
+    def test_getfixturevalue(self, testdir):
         item = testdir.getitem(
             """
             import pytest
@@ -613,35 +651,22 @@ class TestRequestBasic:
             def test_func(something): pass
         """
         )
-        import contextlib
-
-        if getfixmethod == "getfuncargvalue":
-            warning_expectation = pytest.warns(DeprecationWarning)
-        else:
-            # see #1830 for a cleaner way to accomplish this
-            @contextlib.contextmanager
-            def expecting_no_warning():
-                yield
-
-            warning_expectation = expecting_no_warning()
-
         req = item._request
-        with warning_expectation:
-            fixture_fetcher = getattr(req, getfixmethod)
-            with pytest.raises(FixtureLookupError):
-                fixture_fetcher("notexists")
-            val = fixture_fetcher("something")
-            assert val == 1
-            val = fixture_fetcher("something")
-            assert val == 1
-            val2 = fixture_fetcher("other")
-            assert val2 == 2
-            val2 = fixture_fetcher("other")  # see about caching
-            assert val2 == 2
-            pytest._fillfuncargs(item)
-            assert item.funcargs["something"] == 1
-            assert len(get_public_names(item.funcargs)) == 2
-            assert "request" in item.funcargs
+
+        with pytest.raises(FixtureLookupError):
+            req.getfixturevalue("notexists")
+        val = req.getfixturevalue("something")
+        assert val == 1
+        val = req.getfixturevalue("something")
+        assert val == 1
+        val2 = req.getfixturevalue("other")
+        assert val2 == 2
+        val2 = req.getfixturevalue("other")  # see about caching
+        assert val2 == 2
+        pytest._fillfuncargs(item)
+        assert item.funcargs["something"] == 1
+        assert len(get_public_names(item.funcargs)) == 2
+        assert "request" in item.funcargs
 
     def test_request_addfinalizer(self, testdir):
         item = testdir.getitem(
@@ -1140,21 +1165,6 @@ class TestFixtureUsages:
         reprec = testdir.inline_run()
         values = reprec.getfailedcollections()
         assert len(values) == 1
-
-    def test_request_can_be_overridden(self, testdir):
-        testdir.makepyfile(
-            """
-            import pytest
-            @pytest.fixture()
-            def request(request):
-                request.a = 1
-                return request
-            def test_request(request):
-                assert request.a == 1
-        """
-        )
-        reprec = testdir.inline_run("-Wignore::pytest.PytestDeprecationWarning")
-        reprec.assertoutcome(passed=1)
 
     def test_usefixtures_marker(self, testdir):
         testdir.makepyfile(
@@ -2200,7 +2210,7 @@ class TestFixtureMarker:
                     pass
             """
         )
-        result = testdir.runpytest(SHOW_PYTEST_WARNINGS_ARG)
+        result = testdir.runpytest()
         assert result.ret != 0
         result.stdout.fnmatch_lines(
             ["*ScopeMismatch*You tried*function*session*request*"]
@@ -3315,7 +3325,7 @@ class TestShowFixtures:
             @pytest.fixture
             @pytest.fixture
             def foo():
-                pass
+                raise NotImplementedError()
 
 
 class TestContextManagerFixtureFuncs:
@@ -3941,7 +3951,7 @@ def test_call_fixture_function_error():
 
     @pytest.fixture
     def fix():
-        return 1
+        raise NotImplementedError()
 
     with pytest.raises(pytest.fail.Exception):
         assert fix() == 1
@@ -3988,3 +3998,14 @@ def test_fixture_param_shadowing(testdir):
     result.stdout.fnmatch_lines(["*::test_normal_fixture[[]a[]]*"])
     result.stdout.fnmatch_lines(["*::test_normal_fixture[[]b[]]*"])
     result.stdout.fnmatch_lines(["*::test_indirect[[]1[]]*"])
+
+
+def test_fixture_named_request(testdir):
+    testdir.copy_example("fixtures/test_fixture_named_request.py")
+    result = testdir.runpytest()
+    result.stdout.fnmatch_lines(
+        [
+            "*'request' is a reserved word for fixtures, use another name:",
+            "  *test_fixture_named_request.py:5",
+        ]
+    )

@@ -4,12 +4,11 @@ import textwrap
 import types
 
 import attr
-import importlib_metadata
 import py
 
 import pytest
+from _pytest.compat import importlib_metadata
 from _pytest.main import ExitCode
-from _pytest.warnings import SHOW_PYTEST_WARNINGS_ARG
 
 
 def prepend_pythonpath(*dirs):
@@ -343,7 +342,7 @@ class TestGeneralUsage:
         """
         )
         p = testdir.makepyfile("""def test_func(x): pass""")
-        res = testdir.runpytest(p, SHOW_PYTEST_WARNINGS_ARG)
+        res = testdir.runpytest(p)
         assert res.ret == 0
         res.stdout.fnmatch_lines(["*1 skipped*"])
 
@@ -356,9 +355,7 @@ class TestGeneralUsage:
                 pass
         """
         )
-        res = testdir.runpytest(
-            p.basename + "::" + "test_func[1]", SHOW_PYTEST_WARNINGS_ARG
-        )
+        res = testdir.runpytest(p.basename + "::" + "test_func[1]")
         assert res.ret == 0
         res.stdout.fnmatch_lines(["*1 passed*"])
 
@@ -1192,6 +1189,8 @@ def test_warn_on_async_function(testdir):
             pass
         async def test_2():
             pass
+        def test_3():
+            return test_2()
     """
     )
     result = testdir.runpytest()
@@ -1199,11 +1198,43 @@ def test_warn_on_async_function(testdir):
         [
             "test_async.py::test_1",
             "test_async.py::test_2",
-            "*Coroutine functions are not natively supported*",
-            "*2 skipped, 2 warnings in*",
+            "test_async.py::test_3",
+            "*async def functions are not natively supported*",
+            "*3 skipped, 3 warnings in*",
         ]
     )
     # ensure our warning message appears only once
     assert (
-        result.stdout.str().count("Coroutine functions are not natively supported") == 1
+        result.stdout.str().count("async def functions are not natively supported") == 1
+    )
+
+
+@pytest.mark.filterwarnings("default")
+@pytest.mark.skipif(
+    sys.version_info < (3, 6), reason="async gen syntax available in Python 3.6+"
+)
+def test_warn_on_async_gen_function(testdir):
+    testdir.makepyfile(
+        test_async="""
+        async def test_1():
+            yield
+        async def test_2():
+            yield
+        def test_3():
+            return test_2()
+    """
+    )
+    result = testdir.runpytest()
+    result.stdout.fnmatch_lines(
+        [
+            "test_async.py::test_1",
+            "test_async.py::test_2",
+            "test_async.py::test_3",
+            "*async def functions are not natively supported*",
+            "*3 skipped, 3 warnings in*",
+        ]
+    )
+    # ensure our warning message appears only once
+    assert (
+        result.stdout.str().count("async def functions are not natively supported") == 1
     )
