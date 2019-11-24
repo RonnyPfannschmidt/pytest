@@ -144,8 +144,8 @@ class Node(metaclass=NodeMeta):
                 self._nodeid += "::" + self.name
 
     @classmethod
-    def from_parent(cls, parent, *, name):
-        return cls._create(parent=parent, name=name)
+    def from_parent(cls, parent, *, name, **kw):
+        return cls._create(parent=parent, name=name, **kw)
 
     @property
     def ihook(self):
