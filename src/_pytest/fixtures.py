@@ -660,7 +660,7 @@ class FixtureRequest:
                     "\n\nRequested here:\n{}:{}".format(
                         funcitem.nodeid,
                         fixturedef.argname,
-                        getlocation(fixturedef.func, funcitem.config.rootdir),
+                        getlocation(fixturedef.func, funcitem.config.rootpath),
                         source_path_str,
                         source_lineno,
                     )
@@ -1202,7 +1202,7 @@ class FixtureFunctionMarker:
 
         name = self.name or function.__name__
         if name == "request":
-            location = getlocation(function)
+            location = getlocation(function, None)
             fail(
                 "'request' is a reserved word for fixtures, use another name:\n  {}".format(
                     location

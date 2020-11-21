@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Generic
+from typing import NamedTuple
 from typing import Optional
 from typing import Tuple
 from typing import TYPE_CHECKING
@@ -76,18 +77,35 @@ def is_async_function(func: object) -> bool:
     return iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
 
 
-def getlocation(function, curdir: Optional[str] = None) -> str:
+class CodeLocation(NamedTuple):
+    path: Path
+    lineno: int
+
+
+def CodeLocation__str__(self: CodeLocation) -> str:
+    """Python 3.6 hack for NamedTuple __str__"""
+    return f"{self.path}:{self.lineno}"
+
+
+setattr(CodeLocation, "__str__", CodeLocation__str__)
+
+
+def getlocation(function, curdir: Optional[Path]) -> CodeLocation:
     function = get_real_func(function)
     fn = Path(inspect.getfile(function))
     lineno = function.__code__.co_firstlineno
+
+    # TODO: this cycle indicates a larger issue
+    from .pathlib import bestrelpath
+
     if curdir is not None:
         try:
-            relfn = fn.relative_to(curdir)
+            relfn = Path(bestrelpath(curdir, fn))
         except ValueError:
             pass
         else:
-            return "%s:%d" % (relfn, lineno + 1)
-    return "%s:%d" % (fn, lineno + 1)
+            return CodeLocation(relfn, lineno + 1)
+    return CodeLocation(fn, lineno + 1)
 
 
 def num_mock_patch_args(function) -> int:

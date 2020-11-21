@@ -32,7 +32,7 @@ from typing import Union
 
 import py
 
-from _pytest.compat import assert_never
+from _pytest import compat
 from _pytest.outcomes import skip
 from _pytest.warning_types import PytestWarning
 
@@ -526,7 +526,7 @@ def import_path(
         if str(pkg_root) != sys.path[0]:
             sys.path.insert(0, str(pkg_root))
     else:
-        assert_never(mode)
+        compat.assert_never(mode)
 
     importlib.import_module(module_name)
 

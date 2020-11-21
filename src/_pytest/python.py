@@ -4,12 +4,14 @@ import fnmatch
 import inspect
 import itertools
 import os
+import pathlib
 import sys
 import types
 import warnings
 from collections import Counter
 from collections import defaultdict
 from functools import partial
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -38,6 +40,7 @@ from _pytest._code.code import TerminalRepr
 from _pytest._io import TerminalWriter
 from _pytest._io.saferepr import saferepr
 from _pytest.compat import ascii_escaped
+from _pytest.compat import CodeLocation
 from _pytest.compat import final
 from _pytest.compat import get_default_arg_names
 from _pytest.compat import get_real_func
@@ -1405,13 +1408,12 @@ def _show_fixtures_per_test(config: Config, session: Session) -> None:
     import _pytest.config
 
     session.perform_collect()
-    curdir = py.path.local()
+    curdir = pathlib.Path.cwd()
     tw = _pytest.config.create_terminal_writer(config)
     verbose = config.getvalue("verbose")
 
     def get_best_relpath(func):
-        loc = getlocation(func, str(curdir))
-        return curdir.bestrelpath(py.path.local(loc))
+        return getlocation(func, curdir)
 
     def write_fixture(fixture_def: fixtures.FixtureDef[object]) -> None:
         argname = fixture_def.argname
@@ -1461,21 +1463,21 @@ def _showfixtures_main(config: Config, session: Session) -> None:
     import _pytest.config
 
     session.perform_collect()
-    curdir = py.path.local()
+    curdir = Path.cwd()
     tw = _pytest.config.create_terminal_writer(config)
     verbose = config.getvalue("verbose")
 
     fm = session._fixturemanager
 
     available = []
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, CodeLocation]] = set()
 
     for argname, fixturedefs in fm._arg2fixturedefs.items():
         assert fixturedefs is not None
         if not fixturedefs:
             continue
         for fixturedef in fixturedefs:
-            loc = getlocation(fixturedef.func, str(curdir))
+            loc = getlocation(fixturedef.func, curdir)
             if (fixturedef.argname, loc) in seen:
                 continue
             seen.add((fixturedef.argname, loc))
@@ -1483,7 +1485,7 @@ def _showfixtures_main(config: Config, session: Session) -> None:
                 (
                     len(fixturedef.baseid),
                     fixturedef.func.__module__,
-                    curdir.bestrelpath(py.path.local(loc)),
+                    loc,
                     fixturedef.argname,
                     fixturedef,
                 )
@@ -1503,9 +1505,9 @@ def _showfixtures_main(config: Config, session: Session) -> None:
         if fixturedef.scope != "function":
             tw.write(" [%s scope]" % fixturedef.scope, cyan=True)
         if verbose > 0:
-            tw.write(" -- %s" % bestrel, yellow=True)
+            tw.write(" -- %s" % str(bestrel), yellow=True)
         tw.write("\n")
-        loc = getlocation(fixturedef.func, str(curdir))
+        loc = getlocation(fixturedef.func, curdir)
         doc = inspect.getdoc(fixturedef.func)
         if doc:
             write_docstring(tw, doc)
