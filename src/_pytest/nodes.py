@@ -24,6 +24,7 @@ from _pytest.compat import cached_property
 from _pytest.config import Config
 from _pytest.config import ConftestImportFailure
 from _pytest.deprecated import FSCOLLECTOR_GETHOOKPROXY_ISINITPATH
+from _pytest.deprecated import NODE_IMPLIED_ARG
 from _pytest.mark.structures import Mark
 from _pytest.mark.structures import MarkDecorator
 from _pytest.mark.structures import NodeKeywords
@@ -136,6 +137,7 @@ class Node(metaclass=NodeMeta):
             if not parent:
                 raise TypeError("config or parent must be provided")
             self.config = parent.config
+            warnings.warn(NODE_IMPLIED_ARG.format(type=type(self), arg="config"))
 
         #: The pytest session this node is part of.
         if session:
@@ -144,9 +146,12 @@ class Node(metaclass=NodeMeta):
             if not parent:
                 raise TypeError("session or parent must be provided")
             self.session = parent.session
+            warnings.warn(NODE_IMPLIED_ARG.format(type=type(self), arg="session"))
 
         #: Filesystem path where this node was collected from (can be None).
         self.fspath = fspath or getattr(parent, "fspath", None)
+        if fspath is None:
+            warnings.warn(NODE_IMPLIED_ARG.format(type=type(self), arg="fspath"))
 
         #: Keywords/markers collected from all scopes.
         self.keywords = NodeKeywords(self)
@@ -163,6 +168,7 @@ class Node(metaclass=NodeMeta):
         else:
             if not self.parent:
                 raise TypeError("nodeid or parent must be provided")
+            warnings.warn(NODE_IMPLIED_ARG.format(type=type(self), arg="nodeid"))
             self._nodeid = self.parent.nodeid
             if self.name != "()":
                 self._nodeid += "::" + self.name
