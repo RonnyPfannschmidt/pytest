@@ -65,6 +65,12 @@ STRICT_OPTION = PytestDeprecationWarning(
 PRIVATE = PytestDeprecationWarning("A private pytest class or function was used.")
 
 
+NODE_FSPATH = UnformattedWarning(
+    PytestDeprecationWarning,
+    "{type}.fspath is deprecated and will be replaced by {type}.path.\n"
+    "see TODO;URL for details on replacing py.path.local with pathlib.Path",
+)
+
 # You want to make some `__init__` or function "private".
 #
 #   def my_private_function(some, args):
@@ -82,6 +88,8 @@ PRIVATE = PytestDeprecationWarning("A private pytest class or function was used.
 #
 # All other calls will get the default _ispytest=False and trigger
 # the warning (possibly error in the future).
+
+
 def check_ispytest(ispytest: bool) -> None:
     if not ispytest:
         warn(PRIVATE, stacklevel=3)
