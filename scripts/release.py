@@ -8,9 +8,10 @@ from subprocess import check_output
 
 from colorama import Fore
 from colorama import init
+from packaging.version import Version
 
 
-def announce(version, template_name, doc_version):
+def announce(version: Version, template_name, doc_version):
     """Generates a new release announcement entry in the docs."""
     # Get our list of authors
     stdout = check_output(["git", "describe", "--abbrev=0", "--tags"])
@@ -84,7 +85,7 @@ def check_links():
     check_call(["tox", "-e", "docs-checklinks"])
 
 
-def pre_release(version, template_name, doc_version, *, skip_check_links):
+def pre_release(version: Version, template_name, doc_version, *, skip_check_links):
     """Generates new docs, release announcements and creates a local tag."""
     announce(version, template_name, doc_version)
     regen(version)
@@ -102,9 +103,9 @@ def pre_release(version, template_name, doc_version, *, skip_check_links):
     print("Please push your branch and open a PR.")
 
 
-def changelog(version, write_out=False):
+def changelog(version: Version, write_out=False):
     addopts = [] if write_out else ["--draft"]
-    check_call(["towncrier", "--yes", "--version", version] + addopts)
+    check_call(["towncrier", "--yes", "--version", str(version)] + addopts)
 
 
 def main():
@@ -120,7 +121,7 @@ def main():
     parser.add_argument("--skip-check-links", action="store_true", default=False)
     options = parser.parse_args()
     pre_release(
-        options.version,
+        Version(options.version),
         options.template_name,
         options.doc_version,
         skip_check_links=options.skip_check_links,

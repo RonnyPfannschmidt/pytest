@@ -22,6 +22,7 @@ from subprocess import run
 from colorama import Fore
 from colorama import init
 from github3.repos import Repository
+from packaging.version import Version
 
 
 class InvalidFeatureRelease(Exception):
@@ -141,17 +142,17 @@ def find_next_version(
     for v in output.splitlines():
         m = re.match(r"\d.\d.\d+$", v.strip())
         if m:
-            valid_versions.append(tuple(int(x) for x in v.split(".")))
+            valid_versions.append(Version(v))
 
     valid_versions.sort()
     last_version = valid_versions[-1]
 
     if is_major:
-        return f"{last_version[0]+1}.0.0{prerelease}"
+        return f"{last_version.major+1}.0.0{prerelease}"
     elif is_feature_release:
-        return f"{last_version[0]}.{last_version[1] + 1}.0{prerelease}"
+        return f"{last_version.major}.{last_version.minor[1] + 1}.0{prerelease}"
     else:
-        return f"{last_version[0]}.{last_version[1]}.{last_version[2] + 1}{prerelease}"
+        return f"{last_version.major}.{last_version.minor}.{last_version.patch + 1}{prerelease}"
 
 
 def main() -> None:
