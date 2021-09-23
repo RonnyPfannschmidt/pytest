@@ -3,8 +3,6 @@ from typing import Generic
 from typing import Type
 from typing import TypeVar
 
-import attr
-
 from _pytest.compat import final
 
 
@@ -116,7 +114,6 @@ _W = TypeVar("_W", bound=PytestWarning)
 
 
 @final
-@attr.s
 class UnformattedWarning(Generic[_W]):
     """A warning meant to be formatted during runtime.
 
@@ -124,8 +121,18 @@ class UnformattedWarning(Generic[_W]):
     as opposed to a direct message.
     """
 
-    category = attr.ib(type=Type["_W"])
-    template = attr.ib(type=str)
+    category: Type["_W"]
+    template: str
+
+    def __init__(self, category: Type["_W"], template: str):
+        self.category = category
+        self.template = template
+
+    def __repr__(self):
+        return (
+            f"UnformattedWarning(\n  category={self.category.__qualname__},"
+            f"\n  template={self.template!r},\n)"
+        )
 
     def format(self, **kwargs: Any) -> _W:
         """Return an instance of the warning category, formatted with given kwargs."""
