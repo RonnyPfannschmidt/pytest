@@ -15,7 +15,6 @@ from typing import Sequence
 from typing import TYPE_CHECKING
 from typing import Union
 
-from . import nodes
 from _pytest import fixtures
 from _pytest._io.saferepr import saferepr
 from _pytest.compat import ascii_escaped
@@ -300,8 +299,8 @@ class Metafunc:
 
     def __init__(
         self,
-        definition: nodes.FunctionDefinition,
-        fixtureinfo: fixtures.FuncFixtureInfo,
+        definition: "FunctionDefinition",
+        fixtureinfo: "fixtures.FuncFixtureInfo",
         config: Config,
         cls=None,
         module=None,
@@ -607,7 +606,7 @@ class Metafunc:
 
 def _find_parametrized_scope(
     argnames: Sequence[str],
-    arg2fixturedefs: Mapping[str, Sequence[fixtures.FixtureDef[object]]],
+    arg2fixturedefs: Mapping[str, Sequence["fixtures.FixtureDef[object]"]],
     indirect: Union[bool, Sequence[str]],
 ) -> Scope:
     """Find the most appropriate scope for a parametrized call based on its arguments.

@@ -221,10 +221,11 @@ def pytest_configure(config: Config) -> None:
     available at pytest_configure time, but ideally should be moved entirely
     to the tmp_path_factory session fixture.
     """
-    config.stash[tmppath_factory_key]
     mp = MonkeyPatch()
     config.add_cleanup(mp.undo)
     _tmp_path_factory = TempPathFactory.from_config(config, _ispytest=True)
+    config.stash[tmppath_factory_key] = _tmp_path_factory
+
     mp.setattr(config, "_tmp_path_factory", _tmp_path_factory, raising=False)
 
 

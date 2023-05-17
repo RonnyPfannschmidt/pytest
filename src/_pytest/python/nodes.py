@@ -23,6 +23,7 @@ import _pytest
 from .metafunc import CallSpec2
 from .metafunc import Metafunc
 from _pytest import fixtures
+from _pytest import main
 from _pytest import nodes
 from _pytest._code import ExceptionInfo
 from _pytest._code import filter_traceback
@@ -36,8 +37,6 @@ from _pytest.compat import safe_getattr
 from _pytest.config import Config
 from _pytest.deprecated import FSCOLLECTOR_GETHOOKPROXY_ISINITPATH
 from _pytest.deprecated import NOSE_SUPPORT_METHOD
-from _pytest.fixtures import FuncFixtureInfo
-from _pytest.main import Session
 from _pytest.mark.structures import get_unpacked_marks
 from _pytest.outcomes import skip
 from _pytest.pathlib import fnmatch_ex
@@ -276,7 +275,7 @@ class PyCollector(PyobjMixin, nodes.Collector):
         self.ihook.pytest_generate_tests.call_extra(methods, dict(metafunc=metafunc))
 
         if not metafunc._calls:
-            yield Function.from_parent(self, name=name, fixtureinfo=fixtureinfo)
+            yield Function.from_parent(definition, name=name, fixtureinfo=fixtureinfo)
         else:
             # Add funcargs() as fixturedefs to fixtureinfo.arg2fixturedefs.
             fm = self.session._fixturemanager
@@ -290,7 +289,7 @@ class PyCollector(PyobjMixin, nodes.Collector):
             for callspec in metafunc._calls:
                 subname = f"{name}[{callspec.id}]"
                 yield Function.from_parent(
-                    self,
+                    definition,
                     name=subname,
                     callspec=callspec,
                     fixtureinfo=fixtureinfo,
@@ -759,8 +758,8 @@ class Function(PyobjMixin, nodes.Item):
         callspec: Optional[CallSpec2] = None,
         callobj=NOTSET,
         keywords: Optional[Mapping[str, Any]] = None,
-        session: Optional[Session] = None,
-        fixtureinfo: Optional[FuncFixtureInfo] = None,
+        session: Optional["main.Session"] = None,
+        fixtureinfo: Optional["fixtures.FuncFixtureInfo"] = None,
         originalname: Optional[str] = None,
     ) -> None:
         super().__init__(name, parent, config=config, session=session)
@@ -817,12 +816,12 @@ class Function(PyobjMixin, nodes.Item):
         return getimfunc(self.obj)
 
     def _getobj(self):
-        assert self.parent is not None
-        if isinstance(self.parent, Class):
+        parent_of_def = self.parent.parent
+        if isinstance(parent_of_def, Class):
             # Each Function gets a fresh class instance.
-            parent_obj = self.parent.newinstance()
+            parent_obj = parent_of_def.newinstance()
         else:
-            parent_obj = self.parent.obj  # type: ignore[attr-defined]
+            parent_obj = parent_of_def.obj  # type: ignore[attr-defined]
         return getattr(parent_obj, self.originalname)
 
     @property
@@ -869,13 +868,10 @@ class Function(PyobjMixin, nodes.Item):
         return self._repr_failure_py(excinfo, style=style)
 
 
-class FunctionDefinition(Function):
+class FunctionDefinition(PyCollector):
     """
     This class is a step gap solution until we evolve to have actual function definition nodes
     and manage to get rid of ``metafunc``.
     """
 
-    def runtest(self) -> None:
-        raise RuntimeError("function definitions are not supposed to be run as tests")
-
-    setup = runtest
+    def collect(self) -> Iterable[Union[nodes.Item, nodes.Collector]]:

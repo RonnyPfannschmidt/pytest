@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from typing import Union
 
 import _pytest._code
+from _pytest import fixtures
 from _pytest import nodes
 from _pytest.compat import final
 from _pytest.compat import overload
@@ -31,7 +32,6 @@ from _pytest.config import hookimpl
 from _pytest.config import PytestPluginManager
 from _pytest.config import UsageError
 from _pytest.config.argparsing import Parser
-from _pytest.fixtures import FixtureManager
 from _pytest.outcomes import exit
 from _pytest.pathlib import absolutepath
 from _pytest.pathlib import bestrelpath
@@ -460,7 +460,7 @@ class Session(nodes.FSCollector):
     # Set on the session by runner.pytest_sessionstart.
     _setupstate: SetupState
     # Set on the session by fixtures.pytest_sessionstart.
-    _fixturemanager: FixtureManager
+    _fixturemanager: "fixtures.FixtureManager"
     exitstatus: Union[int, ExitCode]
 
     def __init__(self, config: Config) -> None:

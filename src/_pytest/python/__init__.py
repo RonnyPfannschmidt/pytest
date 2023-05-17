@@ -230,15 +230,3 @@ def __getattr__(name: str) -> object:
         warnings.warn(INSTANCE_COLLECTOR, 2)
         return InstanceDummy
     raise AttributeError(f"module {__name__} has no attribute {name}")
-
-
-class FunctionDefinition(nodes.Function):
-    """
-    This class is a step gap solution until we evolve to have actual function definition nodes
-    and manage to get rid of ``metafunc``.
-    """
-
-    def runtest(self) -> None:
-        raise RuntimeError("function definitions are not supposed to be run as tests")
-
-    setup = runtest
