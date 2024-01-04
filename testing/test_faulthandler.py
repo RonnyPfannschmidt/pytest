@@ -109,7 +109,7 @@ def test_timeout(pytester: Pytester, enabled: bool) -> None:
 
 
 @pytest.mark.parametrize("hook_name", ["pytest_enter_pdb", "pytest_exception_interact"])
-def test_cancel_timeout_on_hook(monkeypatch, hook_name) -> None:
+def test_cancel_timeout_on_hook(monkeypatch: pytest.MonkeyPatch, hook_name: str) -> None:
     """Make sure that we are cancelling any scheduled traceback dumping due
     to timeout before entering pdb (pytest-dev/pytest-faulthandler#12) or any
     other interactive exception (pytest-dev/pytest-faulthandler#14)."""
@@ -161,7 +161,7 @@ def test_get_stderr_fileno_invalid_fd() -> None:
         https://github.com/twisted/twisted/blob/twisted-20.3.0/src/twisted/logger/_io.py#L132-L139
         """
 
-        def fileno(self):
+        def fileno(self) -> int:
             return -1
 
     wrapper = StdErrWrapper()

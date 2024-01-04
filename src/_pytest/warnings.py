@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 from contextlib import contextmanager
 import sys
-from typing import Generator
+from typing import Generator, Any
 from typing import Literal
 from typing import Optional
 import warnings
@@ -26,7 +26,7 @@ def pytest_configure(config: Config) -> None:
 @contextmanager
 def catch_warnings_for_item(
     config: Config,
-    ihook,
+    ihook: Any, # needs a pluggy pytest plugin
     when: Literal["config", "collect", "runtest"],
     item: Optional[Item],
 ) -> Generator[None, None, None]:

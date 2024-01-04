@@ -1083,12 +1083,14 @@ class FormattedExcinfo:
 
             if e.__cause__ is not None and self.chain:
                 e = e.__cause__
+                assert e is not None
                 excinfo_ = ExceptionInfo.from_exception(e) if e.__traceback__ else None
                 descr = "The above exception was the direct cause of the following exception:"
             elif (
                 e.__context__ is not None and not e.__suppress_context__ and self.chain
             ):
                 e = e.__context__
+                assert e is not None
                 excinfo_ = ExceptionInfo.from_exception(e) if e.__traceback__ else None
                 descr = "During handling of the above exception, another exception occurred:"
             else:

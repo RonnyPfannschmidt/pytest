@@ -42,7 +42,8 @@ def pytest_configure(config: Config) -> None:
             config.stash[pastebinfile_key] = tempfile.TemporaryFile("w+b")
             oldwrite = tr._tw.write
 
-            def tee_write(s, **kwargs):
+
+            def tee_write(s: Union[str | bytes], **kwargs: object) -> None:
                 oldwrite(s, **kwargs)
                 if isinstance(s, str):
                     s = s.encode("utf-8")

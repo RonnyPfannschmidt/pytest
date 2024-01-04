@@ -501,7 +501,7 @@ class TestPython:
     def test_failure_function(
         self,
         pytester: Pytester,
-        junit_logging,
+        junit_logging: str,
         run_and_parse: RunAndParse,
         xunit_family,
     ) -> None:
@@ -944,17 +944,17 @@ def test_dont_configure_on_workers(tmp_path: Path) -> None:
 
     class FakeConfig:
         if TYPE_CHECKING:
-            workerinput = None
+            workerinput: None = None
 
-        def __init__(self):
+        def __init__(self) -> None:
             self.pluginmanager = self
             self.option = self
             self.stash = Stash()
 
-        def getini(self, name):
+        def getini(self, name: str) -> str:
             return "pytest"
 
-        junitprefix = None
+        junitprefix: None = None
         # XXX: shouldn't need tmp_path ?
         xmlpath = str(tmp_path.joinpath("junix.xml"))
         register = gotten.append

@@ -65,7 +65,7 @@ DOCTEST_REPORT_CHOICES = (
 )
 
 # Lazy definition of runner class
-RUNNER_CLASS = None
+RUNNER_CLASS = Optional[Type["doctest.DocTestRunner"]]= None
 # Lazy definition of output checker class
 CHECKER_CLASS: Optional[Type["doctest.OutputChecker"]] = None
 
