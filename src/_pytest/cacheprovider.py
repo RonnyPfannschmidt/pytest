@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from typing import Final
 from typing import final
 from typing import Generator
 from typing import Iterable
@@ -61,10 +62,10 @@ class Cache:
     _config: Config = dataclasses.field(repr=False)
 
     # Sub-directory under cache-dir for directories created by `mkdir()`.
-    _CACHE_PREFIX_DIRS = "d"
+    _CACHE_PREFIX_DIRS: Final = "d"
 
     # Sub-directory under cache-dir for values created by `set()`.
-    _CACHE_PREFIX_VALUES = "v"
+    _CACHE_PREFIX_VALUES: Final = "v"
 
     def __init__(
         self, cachedir: Path, config: Config, *, _ispytest: bool = False
