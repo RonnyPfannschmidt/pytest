@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from warnings import warn
 
-from _pytest.warning_types import PytestDeprecationWarning
 from _pytest.warning_types import PytestRemovedIn9Warning
 from _pytest.warning_types import PytestWarning
 from _pytest.warning_types import UnformattedWarning
@@ -51,7 +50,7 @@ NODE_CTOR_FSPATH_ARG = UnformattedWarning(
 )
 
 HOOK_LEGACY_MARKING = UnformattedWarning(
-    PytestDeprecationWarning,
+    PytestRemovedIn9Warning,
     "The hook{type} {fullname} uses old-style configuration options (marks or attributes).\n"
     "Please use the pytest.hook{type}({hook_opts}) decorator instead\n"
     " to configure the hooks.\n"
