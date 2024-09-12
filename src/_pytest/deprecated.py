@@ -15,6 +15,7 @@ from warnings import warn
 
 from _pytest.warning_types import PytestDeprecationWarning
 from _pytest.warning_types import PytestRemovedIn9Warning
+from _pytest.warning_types import PytestWarning
 from _pytest.warning_types import UnformattedWarning
 
 
@@ -34,9 +35,7 @@ YIELD_FIXTURE = PytestDeprecationWarning(
     "Use @pytest.fixture instead; they are the same."
 )
 
-# This deprecation is never really meant to be removed.
-PRIVATE = PytestDeprecationWarning("A private pytest class or function was used.")
-
+PRIVATE = PytestWarning("A private pytest internal class or function was used.")
 
 HOOK_LEGACY_PATH_ARG = UnformattedWarning(
     PytestRemovedIn9Warning,
