@@ -101,7 +101,7 @@ class UnitTestCase(Class):
             x = getattr(self.obj, name)
             if not getattr(x, "__test__", True):
                 continue
-            yield TestCaseFunction.from_parent(self, name=name)
+            yield TestCaseFunction.from_parent(self, name=name, callobj=x)
             foundsomething = True
 
         if not foundsomething:
@@ -109,7 +109,9 @@ class UnitTestCase(Class):
             if runtest is not None:
                 ut = sys.modules.get("twisted.trial.unittest", None)
                 if ut is None or runtest != ut.TestCase.runTest:
-                    yield TestCaseFunction.from_parent(self, name="runTest")
+                    yield TestCaseFunction.from_parent(
+                        self, name="runTest", callobj=runtest
+                    )
 
     def _register_unittest_setup_class_fixture(self, cls: type) -> None:
         """Register an auto-use fixture to invoke setUpClass and
@@ -202,9 +204,20 @@ class TestCaseFunction(Function):
     nofuncargs = True
     _excinfo: list[_pytest._code.ExceptionInfo[BaseException]] | None = None
 
-    def _getinstance(self):
+    def __init__(self, **kwargs):
+        # For unittest, we need to handle obj specially
+        # Store the unbound method separately and create bound method as obj
+        super().__init__(**kwargs)
+        # Create the TestCase instance
         assert isinstance(self.parent, UnitTestCase)
-        return self.parent.obj(self.name)
+        self._unittest_instance = self.parent.obj(self.name)
+        # Set obj to the bound method
+        self.obj = getattr(self._unittest_instance, self.name)
+
+    @property
+    def instance(self):
+        """Get the TestCase instance for this test method."""
+        return self._unittest_instance
 
     # Backward compat for pytest-django; can be removed after pytest-django
     # updates + some slack.
@@ -222,7 +235,7 @@ class TestCaseFunction(Function):
             self._explicit_tearDown()
             self._explicit_tearDown = None
         self._obj = None
-        del self._instance
+        self._unittest_instance = None
         super().teardown()
 
     def startTest(self, testcase: unittest.TestCase) -> None:

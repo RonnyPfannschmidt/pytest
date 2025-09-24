@@ -402,6 +402,8 @@ class FixtureRequest(abc.ABC):
         # - In the future we might consider using a generic for the param type, but
         #   for now just using Any.
         self.param: Any
+        # Instance for test methods (created lazily)
+        self._instance: Any | None = None
 
     @property
     def _fixturemanager(self) -> FixtureManager:
@@ -466,7 +468,14 @@ class FixtureRequest(abc.ABC):
         """Instance (can be None) on which test function was collected."""
         if self.scope != "function":
             return None
-        return getattr(self._pyfuncitem, "instance", None)
+        # Check if this is a method that needs an instance
+        clscol = self._pyfuncitem.getparent(_pytest.python.Class)
+        if not clscol:
+            return None
+        # Create instance lazily if not already created
+        if self._instance is None:
+            self._instance = clscol.obj()
+        return self._instance
 
     @property
     def module(self):
@@ -711,6 +720,10 @@ class TopRequest(FixtureRequest):
 
     def _fillfixtures(self) -> None:
         item = self._pyfuncitem
+        # Ensure instance exists if this is a test method
+        if self.instance is not None:
+            # Instance has been created by the property getter
+            pass
         for argname in item.fixturenames:
             if argname not in item.funcargs:
                 item.funcargs[argname] = self.getfixturevalue(argname)
