@@ -147,6 +147,53 @@ def async_fail(nodeid: str) -> None:
     fail(msg, pytrace=False)
 
 
+def call_with_appropriate_args(
+    func: Callable[..., Any], kwargs: dict[str, Any], pyfuncitem: Function
+) -> Any:
+    """Call a function with the appropriate positional and keyword arguments.
+
+    Handles instance methods, class methods, static methods, and regular functions
+    by determining what positional arguments (if any) need to be passed.
+    """
+    # Get the parent class if we're in a class context
+    parent_class = pyfuncitem.parent
+    if not parent_class or not isinstance(parent_class, Class):
+        # Module-level function - no special handling needed
+        return func(**kwargs)
+
+    # We're in a class context - need to determine method type
+    cls = parent_class.obj
+    method_name = pyfuncitem.originalname or pyfuncitem.name
+
+    # Check the actual descriptor in the class __dict__ to determine type
+    # This is more reliable than flags that get passed around
+    raw_method = cls.__dict__.get(method_name)
+
+    if isinstance(raw_method, staticmethod):
+        # Static method - no positional args
+        return func(**kwargs)
+    elif isinstance(raw_method, classmethod):
+        # Class method - may already be bound or not
+        if inspect.ismethod(func):
+            # Already bound, cls is implicit
+            return func(**kwargs)
+        else:
+            # Unbound, need to pass cls
+            return func(cls, **kwargs)
+    else:
+        # Regular instance method - needs instance
+        instance = (
+            pyfuncitem._request.instance if hasattr(pyfuncitem, "_request") else None
+        )
+        if instance is not None:
+            return func(instance, **kwargs)
+        else:
+            # No instance available but we need one
+            raise RuntimeError(
+                f"No instance available for instance method {pyfuncitem.name}"
+            )
+
+
 @hookimpl(trylast=True)
 def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     testfunction = pyfuncitem.obj
@@ -155,16 +202,10 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     funcargs = pyfuncitem.funcargs
     testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
 
-    # Check if we need to pass self as first argument
-    instance = pyfuncitem._request.instance if hasattr(pyfuncitem, "_request") else None
-    if instance is not None:
-        # Call method with instance as first positional argument
-        assert callable(testfunction)
-        result = testfunction(instance, **testargs)
-    else:
-        # Call regular function
-        assert callable(testfunction)
-        result = testfunction(**testargs)
+    assert callable(testfunction)
+
+    # Call the function with appropriate arguments
+    result = call_with_appropriate_args(testfunction, testargs, pyfuncitem)
 
     if hasattr(result, "__await__") or hasattr(result, "__aiter__"):
         async_fail(pyfuncitem.nodeid)
@@ -215,7 +256,7 @@ def path_matches_patterns(path: Path, patterns: Iterable[str]) -> bool:
 
 def pytest_pycollect_makemodule(module_path: Path, parent) -> Module:
     # Simply create the Module, let it handle importing in collect()
-    return Module.from_parent(parent, path=module_path)
+    return Module.from_parent(parent, path=module_path)  # type: ignore[no-any-return]
 
 
 @hookimpl(trylast=True)
@@ -228,12 +269,23 @@ def pytest_pycollect_makeitem(
         if collector.istestclass(obj, name):
             return Class.from_parent(collector, name=name, obj=obj)
     elif collector.istestfunction(obj, name):
-        # mock seems to store unbound methods (issue473), normalize it.
-        obj = getattr(obj, "__func__", obj)
+        # For classmethods, we need the bound method from the class
+        # For staticmethods and regular methods, unwrap as usual
+        if isinstance(obj, classmethod) and isinstance(collector, Class):
+            # Get the bound classmethod from the class object
+            obj = getattr(collector.obj, name)
+        else:
+            # mock seems to store unbound methods (issue473), normalize it.
+            obj = getattr(obj, "__func__", obj)
+
         # We need to try and unwrap the function if it's a functools.partial
         # or a functools.wrapped.
         # We mustn't if it's been wrapped with mock.patch (python 2 only).
-        if not (inspect.isfunction(obj) or inspect.isfunction(get_real_func(obj))):
+        if not (
+            inspect.isfunction(obj)
+            or inspect.isfunction(get_real_func(obj))
+            or inspect.ismethod(obj)
+        ):
             filename, lineno = getfslineno(obj)
             warnings.warn_explicit(
                 message=PytestCollectionWarning(
@@ -262,6 +314,7 @@ class PyobjMixin(nodes.Node):
     """
 
     _ALLOW_MARKERS = True
+    obj: object  # Will be more specific in subclasses
 
     @property
     def module(self):
@@ -540,9 +593,14 @@ def importtestmodule(
 class Module(nodes.File, PyCollector):
     """Collector for test classes and functions in a Python module."""
 
+    obj: types.ModuleType
+
     @classmethod
-    def from_parent(cls, parent, *, path, **kw):
+    def from_parent(cls, parent, *, path: Path | None = None, fspath=None, **kw):
         """Create a Module node."""
+        # Handle both path and fspath for compatibility
+        if path is None and fspath is not None:
+            path = Path(fspath)
         # Don't pass obj - Module will import in collect()
         return super().from_parent(parent=parent, path=path, **kw)
 
@@ -550,6 +608,10 @@ class Module(nodes.File, PyCollector):
         # Import the module (this may raise CollectError)
         if not hasattr(self, "obj") or self.obj is None:
             self.obj = importtestmodule(self.path, self.config)
+            # After importing, collect marks from the module
+            from _pytest.mark.structures import get_unpacked_marks
+
+            self.own_markers.extend(get_unpacked_marks(self.obj))
 
         self._register_setup_module_fixture()
         self._register_setup_function_fixture()
@@ -738,6 +800,8 @@ def _get_first_non_fixture_func(obj: object, names: Iterable[str]) -> object | N
 class Class(PyCollector):
     """Collector for test methods (and nested classes) in a Python class."""
 
+    obj: type
+
     @classmethod
     def from_parent(cls, parent, *, name, obj=None, **kw) -> Self:  # type: ignore[override]
         """The public constructor."""
@@ -773,9 +837,9 @@ class Class(PyCollector):
         self._register_setup_class_fixture()
         self._register_setup_method_fixture()
 
-        # Pass a fresh instance to parsefactories so methods are properly bound
-        # This instance is only used for fixture discovery, not for execution
-        self.session._fixturemanager.parsefactories(self.newinstance(), self.nodeid)
+        # Pass the class object directly to parsefactories
+        # Fixtures will be discovered from the class, not an instance
+        self.session._fixturemanager.parsefactories(self)
 
         return super().collect()
 
@@ -1133,6 +1197,8 @@ class Metafunc:
     test function is defined.
     """
 
+    function: Callable[..., object]  # The test function
+
     def __init__(
         self,
         definition: FunctionDefinition,
@@ -1398,7 +1464,7 @@ class Metafunc:
             ids_,
             self.config,
             nodeid=nodeid,
-            func_name=self.function.__name__,
+            func_name=getattr(self.function, "__name__", "<unknown>"),
         )
         return id_maker.make_unique_parameterset_ids()
 
@@ -1451,7 +1517,7 @@ class Metafunc:
             for arg in indirect:
                 if arg not in argnames:
                     fail(
-                        f"In {self.function.__name__}: indirect fixture '{arg}' doesn't exist",
+                        f"In {getattr(self.function, '__name__', '<unknown>')}: indirect fixture '{arg}' doesn't exist",
                         pytrace=False,
                     )
                 arg_directness[arg] = "indirect"
@@ -1548,6 +1614,8 @@ def _ascii_escaped_by_config(val: str | bytes, config: Config | None) -> str:
 class Function(PyobjMixin, nodes.Item):
     """Item responsible for setting up and executing a Python test function.
 
+    obj: Callable[..., object]  # The test function
+
     :param name:
         The full function name, including any decorations like those
         added by parametrization (``my_func[my_param]``).
@@ -1624,7 +1692,14 @@ class Function(PyobjMixin, nodes.Item):
 
         if fixtureinfo is None:
             fm = self.session._fixturemanager
-            fixtureinfo = fm.getfixtureinfo(self, self.obj, self.cls)
+            # For bound classmethods, don't pass cls since it's already bound in the method
+            # Check if this is a bound method (has __self__ attribute)
+            if inspect.ismethod(self.obj) and hasattr(self.obj, "__self__"):
+                func_for_fixtures = self.obj if callable(self.obj) else None
+                fixtureinfo = fm.getfixtureinfo(self, func_for_fixtures, None)
+            else:
+                func_for_fixtures = self.obj if callable(self.obj) else None  # type: ignore[assignment]
+                fixtureinfo = fm.getfixtureinfo(self, func_for_fixtures, self.cls)
         self._fixtureinfo: FuncFixtureInfo = fixtureinfo
         self.fixturenames = fixtureinfo.names_closure
         self._initrequest()
@@ -1701,6 +1776,9 @@ class Function(PyobjMixin, nodes.Item):
 class FunctionDefinition(Function):
     """This class is a stop gap solution until we evolve to have actual function
     definition nodes and manage to get rid of ``metafunc``."""
+
+    # Explicit type annotation to help mypy
+    obj: Callable[..., object]
 
     def runtest(self) -> None:
         raise RuntimeError("function definitions are not supposed to be run as tests")

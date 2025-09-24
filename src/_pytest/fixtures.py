@@ -468,6 +468,17 @@ class FixtureRequest(abc.ABC):
         """Instance (can be None) on which test function was collected."""
         if self.scope != "function":
             return None
+
+        # For SubRequest, delegate to parent request to share the instance
+        if isinstance(self, SubRequest) and hasattr(self, "_parent_request"):
+            return self._parent_request.instance
+
+        # If the pyfuncitem has its own instance property (e.g., TestCaseFunction), use it
+        if hasattr(self._pyfuncitem, "instance"):
+            pyfuncitem_instance = getattr(self._pyfuncitem, "instance", None)
+            if pyfuncitem_instance is not None:
+                return pyfuncitem_instance
+
         # Check if this is a method that needs an instance
         clscol = self._pyfuncitem.getparent(_pytest.python.Class)
         if not clscol:
@@ -1042,7 +1053,11 @@ class FixtureDef(Generic[FixtureValue]):
         # a parameter value.
         self.ids: Final = ids
         # The names requested by the fixtures.
-        self.argnames: Final = getfuncargnames(func, name=argname)
+        argnames = getfuncargnames(func, name=argname)
+        # Filter out 'self' from argnames - it's not a fixture, it comes from request.instance
+        self.argnames: Final = tuple(arg for arg in argnames if arg != "self")
+        # Remember if this fixture expects self (for method fixtures)
+        self._expects_self: Final = "self" in argnames
         # If the fixture was executed, the current value of the fixture.
         # Can change if the fixture is executed with different parameters.
         self.cached_result: _FixtureCachedResult[FixtureValue] | None = None
@@ -1203,7 +1218,30 @@ def pytest_fixture_setup(
         )
 
     try:
-        result = call_fixture_func(fixturefunc, request, kwargs)
+        # If the fixture expects 'self', pass the instance as first arg
+        if hasattr(fixturedef, "_expects_self") and fixturedef._expects_self:
+            if hasattr(request, "instance") and request.instance is not None:
+                # Call with instance as first positional arg
+                if inspect.isgeneratorfunction(fixturefunc):
+                    generator = fixturefunc(request.instance, **kwargs)
+                    try:
+                        result = next(generator)
+                    except StopIteration:
+                        raise ValueError(
+                            f"{request.fixturename} did not yield a value"
+                        ) from None
+                    finalizer = functools.partial(
+                        _teardown_yield_fixture, fixturefunc, generator
+                    )
+                    request.addfinalizer(finalizer)
+                else:
+                    result = fixturefunc(request.instance, **kwargs)
+            else:
+                raise RuntimeError(
+                    f"No instance available for method fixture {request.fixturename}"
+                )
+        else:
+            result = call_fixture_func(fixturefunc, request, kwargs)
     except TEST_OUTCOME as e:
         if isinstance(e, skip.Exception):
             # The test requested a fixture which caused a skip.
@@ -1213,7 +1251,7 @@ def pytest_fixture_setup(
         fixturedef.cached_result = (None, my_cache_key, (e, e.__traceback__))
         raise
     fixturedef.cached_result = (result, my_cache_key, None)
-    return result
+    return result  # type: ignore[no-any-return]
 
 
 @final
@@ -1732,6 +1770,7 @@ class FixtureManager:
         params: Sequence[object] | None = None,
         ids: tuple[object | None, ...] | Callable[[Any], object | None] | None = None,
         autouse: bool = False,
+        _class_holder: type | None = None,
     ) -> None:
         """Register a fixture
 
@@ -1816,7 +1855,7 @@ class FixtureManager:
             holderobj = node_or_obj
         else:
             assert isinstance(node_or_obj, nodes.Node)
-            holderobj = cast(object, node_or_obj.obj)  # type: ignore[attr-defined]
+            holderobj = node_or_obj.obj
             assert isinstance(node_or_obj.nodeid, str)
             nodeid = node_or_obj.nodeid
         if holderobj in self._holderobjseen:
@@ -1849,15 +1888,22 @@ class FixtureManager:
 
                 func = obj._get_wrapped_function()
 
-                self._register_fixture(
-                    name=fixture_name,
-                    nodeid=nodeid,
-                    func=func,
-                    scope=marker.scope,
-                    params=marker.params,
-                    ids=marker.ids,
-                    autouse=marker.autouse,
-                )
+                # Store whether this is a class method fixture for later handling
+                fixture_kwargs = {
+                    "name": fixture_name,
+                    "nodeid": nodeid,
+                    "func": func,
+                    "scope": marker.scope,
+                    "params": marker.params,
+                    "ids": marker.ids,
+                    "autouse": marker.autouse,
+                }
+
+                # If this is a class, mark fixtures as class fixtures
+                if safe_isclass(holderobj):
+                    fixture_kwargs["_class_holder"] = holderobj
+
+                self._register_fixture(**fixture_kwargs)
 
     def getfixturedefs(
         self, argname: str, node: nodes.Node

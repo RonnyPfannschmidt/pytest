@@ -109,7 +109,7 @@ def evaluate_condition(item: Item, mark: Mark, condition: object) -> tuple[bool,
                     f"pytest_markeval_namespace() needs to return a dict, got {dictionary!r}"
                 )
             globals_.update(dictionary)
-        if hasattr(item, "obj"):
+        if hasattr(item, "obj") and hasattr(item.obj, "__globals__"):
             globals_.update(item.obj.__globals__)
         try:
             filename = f"<{mark.name} condition>"

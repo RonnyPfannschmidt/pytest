@@ -132,9 +132,9 @@ def pytest_collect_file(
         if config.option.doctestmodules and not any(
             (_is_setup_py(file_path), _is_main_py(file_path))
         ):
-            return DoctestModule.from_parent(parent, path=file_path)
+            return DoctestModule.from_parent(parent, path=file_path)  # type: ignore[no-any-return]
     elif _is_doctest(config, file_path, parent):
-        return DoctestTextfile.from_parent(parent, path=file_path)
+        return DoctestTextfile.from_parent(parent, path=file_path)  # type: ignore[no-any-return]
     return None
 
 
@@ -418,7 +418,7 @@ def _get_continue_on_failure(config: Config) -> bool:
 
 
 class DoctestTextfile(Module):
-    obj = None
+    obj: None = None  # type: ignore[assignment]
 
     def collect(self) -> Iterable[DoctestItem]:
         import doctest
