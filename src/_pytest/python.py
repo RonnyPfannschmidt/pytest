@@ -256,7 +256,7 @@ def path_matches_patterns(path: Path, patterns: Iterable[str]) -> bool:
 
 def pytest_pycollect_makemodule(module_path: Path, parent) -> Module:
     # Create the Module and import it immediately so hooks can access mod.obj
-    module = Module.from_parent(parent, path=module_path)  # type: ignore[no-any-return]
+    module: Module = Module.from_parent(parent, path=module_path)
     # Import the module immediately so obj is available for hooks
     if not hasattr(module, "obj") or module.obj is None:
         module.obj = importtestmodule(module.path, module.config)
@@ -326,7 +326,7 @@ class PyobjMixin(nodes.Node):
     obj: object  # Will be more specific in subclasses
 
     def __init__(self, *args, obj=None, **kwargs):
-        super().__init__(*args, obj=obj, **kwargs)
+        super().__init__(*args, **kwargs)
         self.obj = obj
         # Extract markers from the object if provided and markers are allowed
         if obj is not None and self._ALLOW_MARKERS:

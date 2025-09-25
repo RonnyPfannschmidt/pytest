@@ -49,7 +49,6 @@ class TestMetafunc:
         @dataclasses.dataclass
         class DefinitionMock(python.FunctionDefinition):
             _nodeid: str
-            obj: object
 
         names = getfuncargnames(func)
         fixtureinfo: Any = FuncFixtureInfoMock(names)
