@@ -324,7 +324,10 @@ class PyobjMixin(nodes.Node):
         if obj is not None and self._ALLOW_MARKERS:
             from _pytest.mark.structures import get_unpacked_marks
 
-            self.own_markers.extend(get_unpacked_marks(obj))
+            marks = get_unpacked_marks(obj)
+            self.own_markers.extend(marks)
+            # Update keywords with the new marks
+            self.keywords.update((mark.name, mark) for mark in marks)
 
     @property
     def module(self):
@@ -617,7 +620,10 @@ class Module(nodes.File, PyCollector):
             if self._ALLOW_MARKERS:
                 from _pytest.mark.structures import get_unpacked_marks
 
-                self.own_markers.extend(get_unpacked_marks(self._obj))
+                marks = get_unpacked_marks(self._obj)
+                self.own_markers.extend(marks)
+                # Update keywords with the new marks
+                self.keywords.update((mark.name, mark) for mark in marks)
         return self._obj
 
     @obj.setter
@@ -628,7 +634,10 @@ class Module(nodes.File, PyCollector):
         if value is not None and self._ALLOW_MARKERS:
             from _pytest.mark.structures import get_unpacked_marks
 
-            self.own_markers.extend(get_unpacked_marks(value))
+            marks = get_unpacked_marks(value)
+            self.own_markers.extend(marks)
+            # Update keywords with the new marks
+            self.keywords.update((mark.name, mark) for mark in marks)
 
     @classmethod
     def from_parent(cls, parent, *, path: Path | None = None, fspath=None, **kw):
