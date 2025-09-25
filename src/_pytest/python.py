@@ -1757,6 +1757,37 @@ class Function(PyobjMixin, nodes.Item):
     def _initrequest(self) -> None:
         self.funcargs: dict[str, object] = {}
         self._request = fixtures.TopRequest(self, _ispytest=True)
+        # Initialize _instance attribute
+        self._instance: object | None = None
+
+    @property
+    def instance(self) -> object | None:
+        """Python instance object the function is bound to.
+
+        Returns None if not a test method, e.g. for a standalone test function.
+        Creates and caches an instance if this is a method in a test class.
+
+        Even class and static methods get an instance for fixtures to use.
+        """
+        # Check if we already have a cached instance
+        if self._instance is not None:
+            return self._instance
+
+        # Check if this function is in a class
+        cls_node = self.getparent(Class)
+        if cls_node is None:
+            # Not in a class, so no instance
+            return None
+
+        # All methods in a class get an instance (even class/static methods)
+        # This is needed for bound fixture methods
+        try:
+            self._instance = cls_node.newinstance()
+        except Exception:
+            # If we can't create an instance, return None
+            pass
+
+        return self._instance
 
     @property
     def function(self):

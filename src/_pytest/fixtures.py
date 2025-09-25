@@ -1054,10 +1054,43 @@ class FixtureDef(Generic[FixtureValue]):
         self.ids: Final = ids
         # The names requested by the fixtures.
         argnames = getfuncargnames(func, name=argname)
-        # Filter out 'self' from argnames - it's not a fixture, it comes from request.instance
-        self.argnames: Final = tuple(arg for arg in argnames if arg != "self")
-        # Remember if this fixture expects self (for method fixtures)
-        self._expects_self: Final = "self" in argnames
+
+        # Determine the type of method and handle first parameter accordingly
+        is_classmethod = isinstance(func, classmethod)
+        is_staticmethod = isinstance(func, staticmethod)
+
+        # For classmethods and instance methods defined in classes,
+        # the first parameter is not a fixture (it's cls or self)
+        # We detect this based on the method type, not parameter name
+        final_argnames: tuple[str, ...]
+        final_expects_self: bool
+        final_is_classmethod: bool
+
+        if is_classmethod:
+            # Classmethod: first param is cls (regardless of actual name)
+            final_argnames = argnames[1:] if argnames else ()
+            final_expects_self = True
+            final_is_classmethod = True
+        elif is_staticmethod:
+            # Staticmethod: no special first parameter
+            final_argnames = argnames
+            final_expects_self = False
+            final_is_classmethod = False
+        elif baseid and "::" in baseid and argnames:
+            # Instance method in a class (has :: in nodeid and has params)
+            # First parameter is self (regardless of actual name)
+            final_argnames = argnames[1:] if argnames else ()
+            final_expects_self = True
+            final_is_classmethod = False
+        else:
+            # Regular function, not a method
+            final_argnames = argnames
+            final_expects_self = False
+            final_is_classmethod = False
+
+        self.argnames: Final = final_argnames
+        self._expects_self: Final = final_expects_self
+        self._is_classmethod: Final = final_is_classmethod
         # If the fixture was executed, the current value of the fixture.
         # Can change if the fixture is executed with different parameters.
         self.cached_result: _FixtureCachedResult[FixtureValue] | None = None
@@ -1182,9 +1215,26 @@ def resolve_fixture_function(
             fixturefunc.__self__.__class__,
         ):
             return fixturefunc
-        fixturefunc = getimfunc(fixturedef.func)
-        if fixturefunc != fixturedef.func:
-            fixturefunc = fixturefunc.__get__(instance)
+        # For method fixtures (that expect self), we need to bind them
+        if hasattr(fixturedef, "_expects_self") and fixturedef._expects_self:
+            if hasattr(fixturedef, "_is_classmethod") and fixturedef._is_classmethod:
+                # For classmethods, bind to the class instead of instance
+                # Extract the actual function from classmethod
+                if isinstance(fixturedef.func, classmethod):
+                    fixturefunc = fixturedef.func.__func__  # type: ignore[unreachable]
+                else:
+                    fixturefunc = getimfunc(fixturedef.func)
+                # Bind to the class, not the instance
+                fixturefunc = fixturefunc.__get__(None, instance.__class__)
+            else:
+                # Regular instance method - bind to instance
+                fixturefunc = getimfunc(fixturedef.func)
+                fixturefunc = fixturefunc.__get__(instance)
+        else:
+            # Original logic for non-method fixtures
+            fixturefunc = getimfunc(fixturedef.func)
+            if fixturefunc != fixturedef.func:
+                fixturefunc = fixturefunc.__get__(instance)
     return fixturefunc
 
 
@@ -1281,32 +1331,9 @@ def pytest_fixture_setup(
         )
 
     try:
-        # If the fixture expects 'self', pass the instance as first arg
-        if hasattr(fixturedef, "_expects_self") and fixturedef._expects_self:
-            instance = _get_fixture_instance(request, fixturedef)
-            if instance is not None:
-                # Call with instance as first positional arg
-                if inspect.isgeneratorfunction(fixturefunc):
-                    generator = fixturefunc(instance, **kwargs)
-                    try:
-                        result = next(generator)
-                    except StopIteration:
-                        raise ValueError(
-                            f"{request.fixturename} did not yield a value"
-                        ) from None
-                    finalizer = functools.partial(
-                        _teardown_yield_fixture, fixturefunc, generator
-                    )
-                    request.addfinalizer(finalizer)
-                else:
-                    result = fixturefunc(instance, **kwargs)
-            else:
-                raise RuntimeError(
-                    f"No instance available for method fixture {request.fixturename} "
-                    f"with scope {fixturedef.scope}"
-                )
-        else:
-            result = call_fixture_func(fixturefunc, request, kwargs)
+        # resolve_fixture_function already handles binding for method fixtures,
+        # so we just call the function normally
+        result = call_fixture_func(fixturefunc, request, kwargs)
     except TEST_OUTCOME as e:
         if isinstance(e, skip.Exception):
             # The test requested a fixture which caused a skip.
@@ -1316,7 +1343,7 @@ def pytest_fixture_setup(
         fixturedef.cached_result = (None, my_cache_key, (e, e.__traceback__))
         raise
     fixturedef.cached_result = (result, my_cache_key, None)
-    return result  # type: ignore[no-any-return]
+    return result
 
 
 @final
