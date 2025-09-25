@@ -402,6 +402,8 @@ class FixtureRequest(abc.ABC):
         # - In the future we might consider using a generic for the param type, but
         #   for now just using Any.
         self.param: Any
+        # Instance for test methods (created lazily)
+        self._instance: Any | None = None
 
     @property
     def _fixturemanager(self) -> FixtureManager:
@@ -466,7 +468,25 @@ class FixtureRequest(abc.ABC):
         """Instance (can be None) on which test function was collected."""
         if self.scope != "function":
             return None
-        return getattr(self._pyfuncitem, "instance", None)
+
+        # For SubRequest, delegate to parent request to share the instance
+        if isinstance(self, SubRequest) and hasattr(self, "_parent_request"):
+            return self._parent_request.instance
+
+        # If the pyfuncitem has its own instance property (e.g., TestCaseFunction), use it
+        if hasattr(self._pyfuncitem, "instance"):
+            pyfuncitem_instance = getattr(self._pyfuncitem, "instance", None)
+            if pyfuncitem_instance is not None:
+                return pyfuncitem_instance
+
+        # Check if this is a method that needs an instance
+        clscol = self._pyfuncitem.getparent(_pytest.python.Class)
+        if not clscol:
+            return None
+        # Create instance lazily if not already created
+        if self._instance is None:
+            self._instance = clscol.obj()
+        return self._instance
 
     @property
     def module(self):
@@ -711,6 +731,10 @@ class TopRequest(FixtureRequest):
 
     def _fillfixtures(self) -> None:
         item = self._pyfuncitem
+        # Ensure instance exists if this is a test method
+        if self.instance is not None:
+            # Instance has been created by the property getter
+            pass
         for argname in item.fixturenames:
             if argname not in item.funcargs:
                 item.funcargs[argname] = self.getfixturevalue(argname)
@@ -910,8 +934,68 @@ class FixtureLookupErrorRepr(TerminalRepr):
 
 
 def call_fixture_func(
-    fixturefunc: _FixtureFunc[FixtureValue], request: FixtureRequest, kwargs
+    fixturefunc: _FixtureFunc[FixtureValue],
+    request: FixtureRequest,
+    kwargs,
+    fixturedef: FixtureDef[FixtureValue] | None = None,
 ) -> FixtureValue:
+    # Check if this is an unbound method that needs self
+    # This happens for high-scope (session/module) fixtures that are instance methods
+    if fixturedef is not None:
+        expects_self = getattr(fixturedef, "_expects_self", False)
+        is_classmethod = getattr(fixturedef, "_is_classmethod", False)
+        is_staticmethod = isinstance(fixturedef.func, staticmethod)
+
+        # Check if the function is already a bound method (from a plugin instance)
+        is_bound_method = inspect.ismethod(fixturefunc)
+
+        # If it's an instance method but we don't have an instance, we need to provide self
+        # BUT skip this if the method is already bound (from plugin instances)
+        if (
+            expects_self
+            and not is_classmethod
+            and not is_staticmethod
+            and request.instance is None
+            and not is_bound_method
+        ):
+            # Get or create an instance for this fixture
+            # Look for the class from the fixture's qualname
+            qualname = getattr(fixturedef.func, "__qualname__", "")
+            if "." in qualname:
+                class_name = qualname.split(".")[-2]
+                module = getattr(fixturedef.func, "__module__", None)
+                if module:
+                    import sys
+
+                    if module in sys.modules:
+                        mod = sys.modules[module]
+                        if hasattr(mod, class_name):
+                            cls = getattr(mod, class_name)
+                            # Create instance and call method
+                            instance = cls()
+                            if inspect.isgeneratorfunction(fixturefunc):
+                                fixturefunc = cast(
+                                    Callable[..., Generator[FixtureValue]], fixturefunc
+                                )
+                                generator = fixturefunc(instance, **kwargs)
+                                try:
+                                    fixture_result = next(generator)
+                                except StopIteration:
+                                    raise ValueError(
+                                        f"{request.fixturename} did not yield a value"
+                                    ) from None
+                                finalizer = functools.partial(
+                                    _teardown_yield_fixture, fixturefunc, generator
+                                )
+                                request.addfinalizer(finalizer)
+                                return fixture_result
+                            else:
+                                fixturefunc = cast(
+                                    Callable[..., FixtureValue], fixturefunc
+                                )
+                                return fixturefunc(instance, **kwargs)
+
+    # Normal case - fixture is bound or doesn't need self
     if inspect.isgeneratorfunction(fixturefunc):
         fixturefunc = cast(Callable[..., Generator[FixtureValue]], fixturefunc)
         generator = fixturefunc(**kwargs)
@@ -1029,7 +1113,76 @@ class FixtureDef(Generic[FixtureValue]):
         # a parameter value.
         self.ids: Final = ids
         # The names requested by the fixtures.
-        self.argnames: Final = getfuncargnames(func, name=argname)
+        argnames = getfuncargnames(func, name=argname)
+
+        # Determine the type of method and handle first parameter accordingly
+        is_classmethod = isinstance(func, classmethod)
+        is_staticmethod = isinstance(func, staticmethod)
+
+        # Check if the function is already bound (has __self__)
+        # This happens for plugin fixtures where an instance method is registered
+        is_bound_method = hasattr(func, "__self__")
+
+        # Check if this is actually a method defined in the class
+        # (not just a fixture registered from a class context)
+        is_class_method = False
+        if (
+            not is_bound_method
+            and baseid
+            and "::" in baseid
+            and hasattr(func, "__name__")
+        ):
+            # Extract the class from baseid and check if func is actually a method of that class
+            # Only filter first param for actual class methods, not for fixtures registered by the class
+            # Check if func is a method by seeing if it has __qualname__ indicating it's defined in a class
+            qualname = getattr(func, "__qualname__", "")
+            # If qualname contains a dot, it's a method (e.g., "TestClass.method_name")
+            # xunit fixtures have qualname like "Class._register_setup_method_fixture.<locals>.xunit_setup_method_fixture"
+            # which contains "<locals>" indicating it's a nested function, not a class method
+            is_class_method = "." in qualname and "<locals>" not in qualname
+
+        # Check if first parameter is "cls" - this indicates a classmethod even if
+        # it's been wrapped by the fixture decorator
+        if not is_classmethod and is_class_method and argnames and argnames[0] == "cls":
+            is_classmethod = True
+
+        # For classmethods and instance methods defined in classes,
+        # the first parameter is not a fixture (it's cls or self)
+        # We detect this based on the method type, not parameter name
+        final_argnames: tuple[str, ...]
+        final_expects_self: bool
+        final_is_classmethod: bool
+
+        if is_bound_method:
+            # Already bound method (e.g., plugin fixtures) - self is already bound
+            # Don't filter any parameters
+            final_argnames = argnames
+            final_expects_self = False
+            final_is_classmethod = False
+        elif is_classmethod:
+            # Classmethod: first param is cls (regardless of actual name)
+            final_argnames = argnames[1:] if argnames else ()
+            final_expects_self = True
+            final_is_classmethod = True
+        elif is_staticmethod:
+            # Staticmethod: no special first parameter
+            final_argnames = argnames
+            final_expects_self = False
+            final_is_classmethod = False
+        elif is_class_method and argnames:
+            # Instance method in a class - first parameter is self (regardless of actual name)
+            final_argnames = argnames[1:] if argnames else ()
+            final_expects_self = True
+            final_is_classmethod = False
+        else:
+            # Regular function, not a method
+            final_argnames = argnames
+            final_expects_self = False
+            final_is_classmethod = False
+
+        self.argnames: Final = final_argnames
+        self._expects_self: Final = final_expects_self
+        self._is_classmethod: Final = final_is_classmethod
         # If the fixture was executed, the current value of the fixture.
         # Can change if the fixture is executed with different parameters.
         self.cached_result: _FixtureCachedResult[FixtureValue] | None = None
@@ -1136,28 +1289,153 @@ class FixtureDef(Generic[FixtureValue]):
         return f"<FixtureDef argname={self.argname!r} scope={self.scope!r} baseid={self.baseid!r}>"
 
 
+def bind_fixture_function(
+    func: Any,
+    instance: object | None,
+    is_classmethod: bool = False,
+    is_staticmethod: bool = False,
+    expects_self: bool = False,
+) -> Any:
+    """Bind a fixture function to an instance or class as needed.
+
+    This provides a single abstraction for handling:
+    - Regular functions (no binding)
+    - Instance methods (bind to instance)
+    - Class methods (bind to class)
+    - Static methods (no binding)
+
+    Args:
+        func: The function to potentially bind
+        instance: The instance to bind to (if any)
+        is_classmethod: Whether this is a classmethod
+        is_staticmethod: Whether this is a staticmethod
+        expects_self: Whether the function expects a self/cls parameter
+
+    Returns:
+        The appropriately bound (or unbound) function
+    """
+    # Static methods never need binding
+    if is_staticmethod:
+        if isinstance(func, staticmethod):
+            return func.__func__
+        return func
+
+    # Get the underlying function
+    if isinstance(func, classmethod):
+        base_func = func.__func__
+    else:
+        base_func = getimfunc(func)
+
+    # No binding needed if function doesn't expect self/cls
+    if not expects_self:
+        return base_func
+
+    # Class methods bind to the class
+    if is_classmethod:
+        if instance is not None:
+            return base_func.__get__(None, instance.__class__)
+        # No instance, can't bind classmethod properly
+        # This shouldn't normally happen
+        return base_func
+
+    # Instance methods bind to the instance
+    if instance is not None:
+        return base_func.__get__(instance)
+
+    # Instance method but no instance - can't bind
+    return base_func
+
+
 def resolve_fixture_function(
     fixturedef: FixtureDef[FixtureValue], request: FixtureRequest
 ) -> _FixtureFunc[FixtureValue]:
     """Get the actual callable that can be called to obtain the fixture
     value."""
     fixturefunc = fixturedef.func
-    # The fixture function needs to be bound to the actual
-    # request.instance so that code working with "fixturedef" behaves
-    # as expected.
     instance = request.instance
-    if instance is not None:
-        # Handle the case where fixture is defined not in a test class, but some other class
-        # (for example a plugin class with a fixture), see #2270.
-        if hasattr(fixturefunc, "__self__") and not isinstance(
-            instance,
-            fixturefunc.__self__.__class__,
-        ):
+
+    # Handle the case where fixture is defined not in a test class, but some other class
+    # (for example a plugin class with a fixture), see #2270.
+    if instance is not None and hasattr(fixturefunc, "__self__"):
+        if not isinstance(instance, fixturefunc.__self__.__class__):
             return fixturefunc
-        fixturefunc = getimfunc(fixturedef.func)
-        if fixturefunc != fixturedef.func:
-            fixturefunc = fixturefunc.__get__(instance)
-    return fixturefunc
+
+    # Check fixture attributes set during initialization
+    is_classmethod = getattr(fixturedef, "_is_classmethod", False)
+    is_staticmethod = isinstance(fixturefunc, staticmethod)
+    expects_self = getattr(fixturedef, "_expects_self", False)
+
+    # Use the unified binding logic
+    return bind_fixture_function(
+        fixturefunc,
+        instance,
+        is_classmethod=is_classmethod,
+        is_staticmethod=is_staticmethod,
+        expects_self=expects_self,
+    )
+
+
+def _get_fixture_instance(
+    request: FixtureRequest,
+    fixturedef: FixtureDef[Any],
+) -> Any | None:
+    """Get or create an instance for method fixtures.
+
+    For function-scoped fixtures, returns the test instance if available.
+    For other scopes (session, module, class), creates a temporary instance
+    and issues a warning about the deprecated pattern.
+
+    Returns None if no instance can be obtained.
+    """
+    # First try to get the existing instance from the request
+    if hasattr(request, "instance") and request.instance is not None:
+        return request.instance
+
+    # For non-function scoped fixtures that need self, we need to create a fake instance
+    if fixturedef.scope != "function":
+        # Try to find the class that owns this fixture
+        cls = None
+
+        # Check if it's already a bound method
+        if hasattr(fixturedef.func, "__self__"):
+            return fixturedef.func.__self__
+
+        # Try to get the class from parent nodes
+        current = (
+            request._pyfuncitem if hasattr(request, "_pyfuncitem") else request.node
+        )
+        while current is not None:
+            if hasattr(current, "cls") and current.cls is not None:
+                cls = current.cls
+                break
+            current = current.parent
+
+        if cls is not None:
+            # Create a temporary instance and warn with exact location
+            import warnings
+
+            instance = cls()
+
+            # Get the fixture's location for the warning
+            filename = fixturedef.func.__code__.co_filename
+            lineno = fixturedef.func.__code__.co_firstlineno
+
+            from _pytest.warning_types import PytestDeprecationWarning
+
+            warnings.warn_explicit(
+                f"Creating a temporary instance for {fixturedef.scope}-scoped "
+                f"fixture '{fixturedef.argname}' defined as a method in {cls.__name__}. "
+                f"This is deprecated and may lead to unexpected behavior. "
+                f"Consider defining the fixture as a standalone function instead of a method, "
+                f"or change its scope to 'function'.",
+                category=PytestDeprecationWarning,
+                filename=filename,
+                lineno=lineno,
+                module=cls.__module__ if hasattr(cls, "__module__") else None,
+            )
+            return instance
+
+    return None
 
 
 def pytest_fixture_setup(
@@ -1190,7 +1468,9 @@ def pytest_fixture_setup(
         )
 
     try:
-        result = call_fixture_func(fixturefunc, request, kwargs)
+        # resolve_fixture_function already handles binding for method fixtures,
+        # so we just call the function normally
+        result = call_fixture_func(fixturefunc, request, kwargs, fixturedef)
     except TEST_OUTCOME as e:
         if isinstance(e, skip.Exception):
             # The test requested a fixture which caused a skip.
@@ -1719,6 +1999,7 @@ class FixtureManager:
         params: Sequence[object] | None = None,
         ids: tuple[object | None, ...] | Callable[[Any], object | None] | None = None,
         autouse: bool = False,
+        _class_holder: type | None = None,
     ) -> None:
         """Register a fixture
 
@@ -1803,7 +2084,7 @@ class FixtureManager:
             holderobj = node_or_obj
         else:
             assert isinstance(node_or_obj, nodes.Node)
-            holderobj = cast(object, node_or_obj.obj)  # type: ignore[attr-defined]
+            holderobj = node_or_obj.obj
             assert isinstance(node_or_obj.nodeid, str)
             nodeid = node_or_obj.nodeid
         if holderobj in self._holderobjseen:
@@ -1834,17 +2115,43 @@ class FixtureManager:
                 except AttributeError:
                     obj = obj_ub
 
+                # Get the actual function
                 func = obj._get_wrapped_function()
 
-                self._register_fixture(
-                    name=fixture_name,
-                    nodeid=nodeid,
-                    func=func,
-                    scope=marker.scope,
-                    params=marker.params,
-                    ids=marker.ids,
-                    autouse=marker.autouse,
-                )
+                # For plugin instances (not classes/modules), check if we need a bound method
+                if not safe_isclass(holderobj) and not isinstance(
+                    holderobj, types.ModuleType
+                ):
+                    # This is an instance, not a class or module
+                    # Check if the function is an instance method (not static/class method)
+                    is_inst_method = (
+                        not isinstance(func, staticmethod)
+                        and not isinstance(func, classmethod)
+                        and hasattr(func, "__name__")
+                        and "." in getattr(func, "__qualname__", "")
+                    )
+                    if is_inst_method:
+                        # Create a bound method for this instance
+                        import types as types_module
+
+                        func = types_module.MethodType(func, holderobj)
+
+                # Store whether this is a class method fixture for later handling
+                fixture_kwargs = {
+                    "name": fixture_name,
+                    "nodeid": nodeid,
+                    "func": func,
+                    "scope": marker.scope,
+                    "params": marker.params,
+                    "ids": marker.ids,
+                    "autouse": marker.autouse,
+                }
+
+                # If this is a class, mark fixtures as class fixtures
+                if safe_isclass(holderobj):
+                    fixture_kwargs["_class_holder"] = holderobj
+
+                self._register_fixture(**fixture_kwargs)
 
     def getfixturedefs(
         self, argname: str, node: nodes.Node

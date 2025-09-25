@@ -41,6 +41,9 @@ def conftest_setinitial(
 
 
 @pytest.mark.usefixtures("_sys_snapshot")
+@pytest.mark.filterwarnings(
+    "ignore:Creating a temporary instance.*:pytest.PytestDeprecationWarning"
+)
 class TestConftestValueAccessGlobal:
     @pytest.fixture(scope="module", params=["global", "inpackage"])
     def basedir(self, request, tmp_path_factory: TempPathFactory) -> Generator[Path]:

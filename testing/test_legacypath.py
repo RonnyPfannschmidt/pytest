@@ -100,6 +100,9 @@ def test_fixturerequest_getmodulepath(pytester: pytest.Pytester) -> None:
     assert req.fspath == modcol.fspath  # type: ignore[attr-defined]
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Creating a temporary instance.*:pytest.PytestDeprecationWarning"
+)
 class TestFixtureRequestSessionScoped:
     @pytest.fixture(scope="session")
     def session_request(self, request):

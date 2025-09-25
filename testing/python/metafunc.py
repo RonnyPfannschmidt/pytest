@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Sequence
 import dataclasses
@@ -46,10 +47,19 @@ class TestMetafunc:
         class SessionMock:
             _fixturemanager: FixtureManagerMock
 
-        @dataclasses.dataclass
         class DefinitionMock(python.FunctionDefinition):
             _nodeid: str
-            obj: object
+            obj: Callable[..., object]
+
+            def __init__(
+                self,
+                *,
+                _nodeid: str,
+                obj: Callable[..., object],
+                **kwargs,
+            ):
+                self._nodeid = _nodeid
+                self.obj = obj
 
         names = getfuncargnames(func)
         fixtureinfo: Any = FuncFixtureInfoMock(names)

@@ -1134,6 +1134,9 @@ class TestRequestBasic:
         reprec.assertoutcome(passed=2)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Creating a temporary instance.*:pytest.PytestDeprecationWarning"
+)
 class TestRequestSessionScoped:
     @pytest.fixture(scope="session")
     def session_request(self, request):
@@ -1748,13 +1751,18 @@ class TestFixtureManagerParseFactories:
                 def hello(self, request):
                     return "class"
                 def test_hello(self, item, fm):
+                    from _pytest.fixtures import resolve_fixture_function
                     faclist = fm.getfixturedefs("hello", item)
                     print(faclist)
                     assert len(faclist) == 3
 
                     assert faclist[0].func(item._request) == "conftest"
                     assert faclist[1].func(item._request) == "module"
-                    assert faclist[2].func(item._request) == "class"
+
+                    # For class method fixtures, resolve_fixture_function returns a bound method
+                    resolved_func = resolve_fixture_function(faclist[2], item._request)
+                    # The bound method only needs the request argument since self is already bound
+                    assert resolved_func(item._request) == "class"
             """
         )
         reprec = pytester.inline_run("-s")

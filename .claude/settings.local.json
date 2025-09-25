@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(uv run pytest:*)"
+    ],
+    "deny": []
+  },
+  "outputStyle": "default"
+}

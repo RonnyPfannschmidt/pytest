@@ -147,6 +147,53 @@ def async_fail(nodeid: str) -> None:
     fail(msg, pytrace=False)
 
 
+def call_with_appropriate_args(
+    func: Callable[..., Any], kwargs: dict[str, Any], pyfuncitem: Function
+) -> Any:
+    """Call a function with the appropriate positional and keyword arguments.
+
+    Handles instance methods, class methods, static methods, and regular functions
+    by determining what positional arguments (if any) need to be passed.
+    """
+    # Get the parent class if we're in a class context
+    parent_class = pyfuncitem.parent
+    if not parent_class or not isinstance(parent_class, Class):
+        # Module-level function - no special handling needed
+        return func(**kwargs)
+
+    # We're in a class context - need to determine method type
+    cls = parent_class.obj
+    method_name = pyfuncitem.originalname or pyfuncitem.name
+
+    # Check the actual descriptor in the class __dict__ to determine type
+    # This is more reliable than flags that get passed around
+    raw_method = cls.__dict__.get(method_name)
+
+    if isinstance(raw_method, staticmethod):
+        # Static method - no positional args
+        return func(**kwargs)
+    elif isinstance(raw_method, classmethod):
+        # Class method - may already be bound or not
+        if inspect.ismethod(func):
+            # Already bound, cls is implicit
+            return func(**kwargs)
+        else:
+            # Unbound, need to pass cls
+            return func(cls, **kwargs)
+    else:
+        # Regular instance method - needs instance
+        instance = (
+            pyfuncitem._request.instance if hasattr(pyfuncitem, "_request") else None
+        )
+        if instance is not None:
+            return func(instance, **kwargs)
+        else:
+            # No instance available but we need one
+            raise RuntimeError(
+                f"No instance available for instance method {pyfuncitem.name}"
+            )
+
+
 @hookimpl(trylast=True)
 def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     testfunction = pyfuncitem.obj
@@ -154,7 +201,12 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
         async_fail(pyfuncitem.nodeid)
     funcargs = pyfuncitem.funcargs
     testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
-    result = testfunction(**testargs)
+
+    assert callable(testfunction)
+
+    # Call the function with appropriate arguments
+    result = call_with_appropriate_args(testfunction, testargs, pyfuncitem)
+
     if hasattr(result, "__await__") or hasattr(result, "__aiter__"):
         async_fail(pyfuncitem.nodeid)
     elif result is not None:
@@ -203,7 +255,9 @@ def path_matches_patterns(path: Path, patterns: Iterable[str]) -> bool:
 
 
 def pytest_pycollect_makemodule(module_path: Path, parent) -> Module:
-    return Module.from_parent(parent, path=module_path)
+    # Create the Module, but delay import until collect() to preserve error handling
+    module: Module = Module.from_parent(parent, path=module_path)
+    return module
 
 
 @hookimpl(trylast=True)
@@ -216,12 +270,23 @@ def pytest_pycollect_makeitem(
         if collector.istestclass(obj, name):
             return Class.from_parent(collector, name=name, obj=obj)
     elif collector.istestfunction(obj, name):
-        # mock seems to store unbound methods (issue473), normalize it.
-        obj = getattr(obj, "__func__", obj)
+        # For classmethods, we need the bound method from the class
+        # For staticmethods and regular methods, unwrap as usual
+        if isinstance(obj, classmethod) and isinstance(collector, Class):
+            # Get the bound classmethod from the class object
+            obj = getattr(collector.obj, name)
+        else:
+            # mock seems to store unbound methods (issue473), normalize it.
+            obj = getattr(obj, "__func__", obj)
+
         # We need to try and unwrap the function if it's a functools.partial
         # or a functools.wrapped.
         # We mustn't if it's been wrapped with mock.patch (python 2 only).
-        if not (inspect.isfunction(obj) or inspect.isfunction(get_real_func(obj))):
+        if not (
+            inspect.isfunction(obj)
+            or inspect.isfunction(get_real_func(obj))
+            or inspect.ismethod(obj)
+        ):
             filename, lineno = getfslineno(obj)
             warnings.warn_explicit(
                 message=PytestCollectionWarning(
@@ -243,12 +308,26 @@ def pytest_pycollect_makeitem(
 
 
 class PyobjMixin(nodes.Node):
-    """this mix-in inherits from Node to carry over the typing information
+    """Mixin for nodes that represent Python objects.
 
-    as its intended to always mix in before a node
-    its position in the mro is unaffected"""
+    The Python object is stored in the 'obj' attribute, which is set
+    eagerly when the node is created (passed through the constructor).
+    """
 
     _ALLOW_MARKERS = True
+    obj: object  # Will be more specific in subclasses
+
+    def __init__(self, *args, obj=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.obj = obj
+        # Extract markers from the object if provided and markers are allowed
+        if obj is not None and self._ALLOW_MARKERS:
+            from _pytest.mark.structures import get_unpacked_marks
+
+            marks = get_unpacked_marks(obj)
+            self.own_markers.extend(marks)
+            # Update keywords with the new marks
+            self.keywords.update((mark.name, mark) for mark in marks)
 
     @property
     def module(self):
@@ -271,32 +350,6 @@ class PyobjMixin(nodes.Node):
         """
         # Overridden by Function.
         return None
-
-    @property
-    def obj(self):
-        """Underlying Python object."""
-        obj = getattr(self, "_obj", None)
-        if obj is None:
-            self._obj = obj = self._getobj()
-            # XXX evil hack
-            # used to avoid Function marker duplication
-            if self._ALLOW_MARKERS:
-                self.own_markers.extend(get_unpacked_marks(self.obj))
-                # This assumes that `obj` is called before there is a chance
-                # to add custom keys to `self.keywords`, so no fear of overriding.
-                self.keywords.update((mark.name, mark) for mark in self.own_markers)
-        return obj
-
-    @obj.setter
-    def obj(self, value):
-        self._obj = value
-
-    def _getobj(self):
-        """Get the underlying Python object. May be overwritten by subclasses."""
-        # TODO: Improve the type of `parent` such that assert/ignore aren't needed.
-        assert self.parent is not None
-        obj = self.parent.obj  # type: ignore[attr-defined]
-        return getattr(obj, self.name)
 
     def getmodpath(self, stopatmodule: bool = True, includemodule: bool = False) -> str:
         """Return Python path relative to the containing module."""
@@ -417,7 +470,10 @@ class PyCollector(PyobjMixin, nodes.Collector, abc.ABC):
                 if not collect_imported_tests and isinstance(self, Module):
                     # Do not collect functions and classes from other modules.
                     if inspect.isfunction(obj) or inspect.isclass(obj):
-                        if obj.__module__ != self._getobj().__name__:
+                        assert hasattr(
+                            self.obj, "__name__"
+                        )  # Module objects have __name__
+                        if obj.__module__ != self.obj.__name__:
                             continue
 
                 res = ihook.pytest_pycollect_makeitem(
@@ -466,7 +522,9 @@ class PyCollector(PyobjMixin, nodes.Collector, abc.ABC):
         self.ihook.pytest_generate_tests.call_extra(methods, dict(metafunc=metafunc))
 
         if not metafunc._calls:
-            yield Function.from_parent(self, name=name, fixtureinfo=fixtureinfo)
+            yield Function.from_parent(
+                self, name=name, callobj=funcobj, fixtureinfo=fixtureinfo
+            )
         else:
             metafunc._recompute_direct_params_indices()
             # Direct parametrizations taking place in module/class-specific
@@ -481,6 +539,7 @@ class PyCollector(PyobjMixin, nodes.Collector, abc.ABC):
                 yield Function.from_parent(
                     self,
                     name=subname,
+                    callobj=funcobj,
                     callspec=callspec,
                     fixtureinfo=fixtureinfo,
                     keywords={callspec.id: True},
@@ -547,10 +606,53 @@ def importtestmodule(
 class Module(nodes.File, PyCollector):
     """Collector for test classes and functions in a Python module."""
 
-    def _getobj(self):
-        return importtestmodule(self.path, self.config)
+    _obj: types.ModuleType | None = None
+
+    @property  # type: ignore[override]
+    def obj(self) -> types.ModuleType:
+        """Import and return the module object, caching the result."""
+        # TODO: The type: ignore above is needed because the base class PyobjMixin
+        # declares obj as a simple attribute, not a property. We should refactor
+        # the inheritance hierarchy to handle this properly.
+        if self._obj is None:
+            self._obj = importtestmodule(self.path, self.config)
+            # Extract markers from the module after importing
+            if self._ALLOW_MARKERS:
+                from _pytest.mark.structures import get_unpacked_marks
+
+                marks = get_unpacked_marks(self._obj)
+                self.own_markers.extend(marks)
+                # Update keywords with the new marks
+                self.keywords.update((mark.name, mark) for mark in marks)
+        return self._obj
+
+    @obj.setter
+    def obj(self, value: types.ModuleType) -> None:
+        """Allow setting the module object directly."""
+        self._obj = value
+        # Extract markers when obj is set (unless it's None)
+        if value is not None and self._ALLOW_MARKERS:
+            from _pytest.mark.structures import get_unpacked_marks
+
+            marks = get_unpacked_marks(value)
+            self.own_markers.extend(marks)
+            # Update keywords with the new marks
+            self.keywords.update((mark.name, mark) for mark in marks)
+
+    @classmethod
+    def from_parent(cls, parent, *, path: Path | None = None, fspath=None, **kw):
+        """Create a Module node."""
+        # Handle both path and fspath for compatibility
+        if path is None and fspath is not None:
+            path = Path(fspath)
+        # Don't pass obj - Module will lazy load it via property
+        return super().from_parent(parent=parent, path=path, **kw)
 
     def collect(self) -> Iterable[nodes.Item | nodes.Collector]:
+        # Access obj property to ensure module is imported
+        # The property will handle importing and marker extraction
+        _ = self.obj
+
         self._register_setup_module_fixture()
         self._register_setup_function_fixture()
         self.session._fixturemanager.parsefactories(self)
@@ -581,6 +683,7 @@ class Module(nodes.File, PyCollector):
             if teardown_module is not None:
                 _call_with_optional_argument(teardown_module, module)
 
+        assert hasattr(self.obj, "__name__")  # Module objects have __name__
         self.session._fixturemanager._register_fixture(
             # Use a unique name to speed up lookup.
             name=f"_xunit_setup_module_fixture_{self.obj.__name__}",
@@ -617,6 +720,7 @@ class Module(nodes.File, PyCollector):
             if teardown_function is not None:
                 _call_with_optional_argument(teardown_function, function)
 
+        assert hasattr(self.obj, "__name__")  # Module objects have __name__
         self.session._fixturemanager._register_fixture(
             # Use a unique name to speed up lookup.
             name=f"_xunit_setup_function_fixture_{self.obj.__name__}",
@@ -736,10 +840,12 @@ def _get_first_non_fixture_func(obj: object, names: Iterable[str]) -> object | N
 class Class(PyCollector):
     """Collector for test methods (and nested classes) in a Python class."""
 
+    obj: type
+
     @classmethod
     def from_parent(cls, parent, *, name, obj=None, **kw) -> Self:  # type: ignore[override]
         """The public constructor."""
-        return super().from_parent(name=name, parent=parent, **kw)
+        return super().from_parent(name=name, parent=parent, obj=obj, **kw)
 
     def newinstance(self):
         return self.obj()
@@ -749,6 +855,7 @@ class Class(PyCollector):
             return []
         if hasinit(self.obj):
             assert self.parent is not None
+            assert hasattr(self.obj, "__name__")  # Class objects have __name__
             self.warn(
                 PytestCollectionWarning(
                     f"cannot collect test class {self.obj.__name__!r} because it has a "
@@ -758,6 +865,7 @@ class Class(PyCollector):
             return []
         elif hasnew(self.obj):
             assert self.parent is not None
+            assert hasattr(self.obj, "__name__")  # Class objects have __name__
             self.warn(
                 PytestCollectionWarning(
                     f"cannot collect test class {self.obj.__name__!r} because it has a "
@@ -769,7 +877,9 @@ class Class(PyCollector):
         self._register_setup_class_fixture()
         self._register_setup_method_fixture()
 
-        self.session._fixturemanager.parsefactories(self.newinstance(), self.nodeid)
+        # Pass the class object directly to parsefactories
+        # Fixtures will be discovered from the class, not an instance
+        self.session._fixturemanager.parsefactories(self)
 
         return super().collect()
 
@@ -795,6 +905,7 @@ class Class(PyCollector):
                 func = getimfunc(teardown_class)
                 _call_with_optional_argument(func, cls)
 
+        assert hasattr(self.obj, "__qualname__")  # Class objects have __qualname__
         self.session._fixturemanager._register_fixture(
             # Use a unique name to speed up lookup.
             name=f"_xunit_setup_class_fixture_{self.obj.__qualname__}",
@@ -820,15 +931,22 @@ class Class(PyCollector):
 
         def xunit_setup_method_fixture(request) -> Generator[None]:
             instance = request.instance
+            # Get the bound method instead of the unbound function
             method = request.function
+            if instance is not None and hasattr(method, "__name__"):
+                # Try to get the bound method from the instance
+                bound_method = getattr(instance, method.__name__, method)
+            else:
+                bound_method = method
             if setup_method is not None:
                 func = getattr(instance, setup_name)
-                _call_with_optional_argument(func, method)
+                _call_with_optional_argument(func, bound_method)
             yield
             if teardown_method is not None:
                 func = getattr(instance, teardown_name)
-                _call_with_optional_argument(func, method)
+                _call_with_optional_argument(func, bound_method)
 
+        assert hasattr(self.obj, "__qualname__")  # Class objects have __qualname__
         self.session._fixturemanager._register_fixture(
             # Use a unique name to speed up lookup.
             name=f"_xunit_setup_method_fixture_{self.obj.__qualname__}",
@@ -1125,6 +1243,8 @@ class Metafunc:
     test function is defined.
     """
 
+    function: Callable[..., object]  # The test function
+
     def __init__(
         self,
         definition: FunctionDefinition,
@@ -1390,7 +1510,7 @@ class Metafunc:
             ids_,
             self.config,
             nodeid=nodeid,
-            func_name=self.function.__name__,
+            func_name=getattr(self.function, "__name__", "<unknown>"),
         )
         return id_maker.make_unique_parameterset_ids()
 
@@ -1443,7 +1563,7 @@ class Metafunc:
             for arg in indirect:
                 if arg not in argnames:
                     fail(
-                        f"In {self.function.__name__}: indirect fixture '{arg}' doesn't exist",
+                        f"In {getattr(self.function, '__name__', '<unknown>')}: indirect fixture '{arg}' doesn't exist",
                         pytrace=False,
                     )
                 arg_directness[arg] = "indirect"
@@ -1540,6 +1660,8 @@ def _ascii_escaped_by_config(val: str | bytes, config: Config | None) -> str:
 class Function(PyobjMixin, nodes.Item):
     """Item responsible for setting up and executing a Python test function.
 
+    obj: Callable[..., object]  # The test function
+
     :param name:
         The full function name, including any decorations like those
         added by parametrization (``my_func[my_param]``).
@@ -1575,17 +1697,18 @@ class Function(PyobjMixin, nodes.Item):
         parent,
         config: Config | None = None,
         callspec: CallSpec2 | None = None,
-        callobj=NOTSET,
+        callobj=None,
         keywords: Mapping[str, Any] | None = None,
         session: Session | None = None,
         fixtureinfo: FuncFixtureInfo | None = None,
         originalname: str | None = None,
     ) -> None:
-        super().__init__(name, parent, config=config, session=session)
+        # Pass obj through to Node
+        super().__init__(name, parent, config=config, session=session, obj=callobj)
 
-        if callobj is not NOTSET:
-            self._obj = callobj
-            self._instance = getattr(callobj, "__self__", None)
+        # Function should always have an unbound callable
+        if callobj is None:
+            raise ValueError("callobj is required for Function")
 
         #: Original function name, without any decorations (for example
         #: parametrization adds a ``"[...]"`` suffix to function names), used to access
@@ -1615,53 +1738,70 @@ class Function(PyobjMixin, nodes.Item):
 
         if fixtureinfo is None:
             fm = self.session._fixturemanager
-            fixtureinfo = fm.getfixtureinfo(self, self.obj, self.cls)
+            # For bound classmethods, don't pass cls since it's already bound in the method
+            # Check if this is a bound method (has __self__ attribute)
+            if inspect.ismethod(self.obj) and hasattr(self.obj, "__self__"):
+                func_for_fixtures = self.obj if callable(self.obj) else None
+                fixtureinfo = fm.getfixtureinfo(self, func_for_fixtures, None)
+            else:
+                func_for_fixtures = self.obj if callable(self.obj) else None  # type: ignore[assignment]
+                fixtureinfo = fm.getfixtureinfo(self, func_for_fixtures, self.cls)
         self._fixtureinfo: FuncFixtureInfo = fixtureinfo
         self.fixturenames = fixtureinfo.names_closure
         self._initrequest()
 
     # todo: determine sound type limitations
     @classmethod
-    def from_parent(cls, parent, **kw) -> Self:
+    def from_parent(cls, parent, *, callobj=None, **kw) -> Self:
         """The public constructor."""
-        return super().from_parent(parent=parent, **kw)
+        if callobj is None:
+            # Try to get the callable from the parent using the name
+            name = kw.get("name")
+            if name and hasattr(parent, "obj"):
+                callobj = getattr(parent.obj, name, None)
+            if callobj is None:
+                raise ValueError(f"Could not find callobj for {name} in {parent}")
+        return super().from_parent(parent=parent, callobj=callobj, **kw)
 
     def _initrequest(self) -> None:
         self.funcargs: dict[str, object] = {}
         self._request = fixtures.TopRequest(self, _ispytest=True)
+        # Initialize _instance attribute
+        self._instance: object | None = None
+
+    @property
+    def instance(self) -> object | None:
+        """Python instance object the function is bound to.
+
+        Returns None if not a test method, e.g. for a standalone test function.
+        Creates and caches an instance if this is a method in a test class.
+
+        Even class and static methods get an instance for fixtures to use.
+        """
+        # Check if we already have a cached instance
+        if self._instance is not None:
+            return self._instance
+
+        # Check if this function is in a class
+        cls_node = self.getparent(Class)
+        if cls_node is None:
+            # Not in a class, so no instance
+            return None
+
+        # All methods in a class get an instance (even class/static methods)
+        # This is needed for bound fixture methods
+        try:
+            self._instance = cls_node.newinstance()
+        except Exception:
+            # If we can't create an instance, return None
+            pass
+
+        return self._instance
 
     @property
     def function(self):
         """Underlying python 'function' object."""
         return getimfunc(self.obj)
-
-    @property
-    def instance(self):
-        try:
-            return self._instance
-        except AttributeError:
-            if isinstance(self.parent, Class):
-                # Each Function gets a fresh class instance.
-                self._instance = self._getinstance()
-            else:
-                self._instance = None
-        return self._instance
-
-    def _getinstance(self):
-        if isinstance(self.parent, Class):
-            # Each Function gets a fresh class instance.
-            return self.parent.newinstance()
-        else:
-            return None
-
-    def _getobj(self):
-        instance = self.instance
-        if instance is not None:
-            parent_obj = instance
-        else:
-            assert self.parent is not None
-            parent_obj = self.parent.obj  # type: ignore[attr-defined]
-        return getattr(parent_obj, self.originalname)
 
     @property
     def _pyfuncitem(self):
@@ -1676,7 +1816,7 @@ class Function(PyobjMixin, nodes.Item):
         self._request._fillfixtures()
 
     def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
-        if hasattr(self, "_obj") and not self.config.getoption("fulltrace", False):
+        if hasattr(self, "obj") and not self.config.getoption("fulltrace", False):
             code = _pytest._code.Code.from_function(get_real_func(self.obj))
             path, firstlineno = code.path, code.firstlineno
             traceback = excinfo.traceback
@@ -1718,6 +1858,9 @@ class Function(PyobjMixin, nodes.Item):
 class FunctionDefinition(Function):
     """This class is a stop gap solution until we evolve to have actual function
     definition nodes and manage to get rid of ``metafunc``."""
+
+    # Explicit type annotation to help mypy
+    obj: Callable[..., object]
 
     def runtest(self) -> None:
         raise RuntimeError("function definitions are not supposed to be run as tests")

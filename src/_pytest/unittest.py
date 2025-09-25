@@ -71,6 +71,7 @@ class UnitTestCase(Class):
     # Marker for fixturemanger.getfixtureinfo()
     # to declare that our children do not support funcargs.
     nofuncargs = True
+    obj: type[unittest.TestCase]  # UnitTestCase always has a TestCase class
 
     def newinstance(self):
         # TestCase __init__ takes the method (test) name. The TestCase
@@ -101,7 +102,7 @@ class UnitTestCase(Class):
             x = getattr(self.obj, name)
             if not getattr(x, "__test__", True):
                 continue
-            yield TestCaseFunction.from_parent(self, name=name)
+            yield TestCaseFunction.from_parent(self, name=name, callobj=x)
             foundsomething = True
 
         if not foundsomething:
@@ -109,7 +110,9 @@ class UnitTestCase(Class):
             if runtest is not None:
                 ut = sys.modules.get("twisted.trial.unittest", None)
                 if ut is None or runtest != ut.TestCase.runTest:
-                    yield TestCaseFunction.from_parent(self, name="runTest")
+                    yield TestCaseFunction.from_parent(
+                        self, name="runTest", callobj=runtest
+                    )
 
     def _register_unittest_setup_class_fixture(self, cls: type) -> None:
         """Register an auto-use fixture to invoke setUpClass and
@@ -201,10 +204,32 @@ class UnitTestCase(Class):
 class TestCaseFunction(Function):
     nofuncargs = True
     _excinfo: list[_pytest._code.ExceptionInfo[BaseException]] | None = None
+    _unittest_instance: unittest.TestCase | None = None
+    _unbound_obj: Callable[..., object] | None = None
 
-    def _getinstance(self):
-        assert isinstance(self.parent, UnitTestCase)
-        return self.parent.obj(self.name)
+    def __init__(self, **kwargs):
+        # Store the unbound method for marks
+        self._unbound_obj = kwargs.get("callobj")
+        # For unittest, pass the unbound method as obj initially
+        # This ensures marks from the unbound method are collected
+        super().__init__(**kwargs)
+        # After initialization, switch to using bound method as obj
+        if self._unbound_obj:
+            # Create a bound method and set it as obj
+            # This satisfies tests that expect obj to be a bound method
+            self.obj = self._getobj()
+
+    @property
+    def instance(self):
+        """Get or create the TestCase instance for this test method."""
+        if self._unittest_instance is None:
+            assert isinstance(self.parent, UnitTestCase)
+            self._unittest_instance = self.parent.obj(self.name)
+        return self._unittest_instance
+
+    def _getobj(self):
+        """Get the bound test method."""
+        return getattr(self.instance, self.name)
 
     # Backward compat for pytest-django; can be removed after pytest-django
     # updates + some slack.
@@ -222,7 +247,7 @@ class TestCaseFunction(Function):
             self._explicit_tearDown()
             self._explicit_tearDown = None
         self._obj = None
-        del self._instance
+        self._unittest_instance = None
         super().teardown()
 
     def startTest(self, testcase: unittest.TestCase) -> None:
@@ -342,13 +367,25 @@ class TestCaseFunction(Function):
                 self._explicit_tearDown = testcase.tearDown
                 setattr(testcase, "tearDown", lambda *args: None)
 
-            # We need to update the actual bound method with self.obj, because
-            # wrap_pytest_function_for_tracing replaces self.obj by a wrapper.
-            setattr(testcase, self.name, self.obj)
+            # We need to update the actual method on the instance
+            # wrap_pytest_function_for_tracing might have wrapped the method
+            # The bound method is already set on testcase, so we don't need to do anything
+            # unless there's been wrapping
+            original_func = getattr(self.parent.obj, self.name)
+            wrapped = False
+            if self._unbound_obj and self._unbound_obj != original_func:
+                # The function has been wrapped, need to update on testcase
+                import types
+
+                bound_method = types.MethodType(self._unbound_obj, testcase)
+                setattr(testcase, self.name, bound_method)
+                wrapped = True
             try:
                 testcase(result=self)
             finally:
-                delattr(testcase, self.name)
+                # Only delete if we added a wrapped version
+                if wrapped:
+                    delattr(testcase, self.name)
 
     def _traceback_filter(
         self, excinfo: _pytest._code.ExceptionInfo[BaseException]

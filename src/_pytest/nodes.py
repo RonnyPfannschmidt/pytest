@@ -162,6 +162,7 @@ class Node(abc.ABC, metaclass=NodeMeta):
         fspath: LEGACY_PATH | None = None,
         path: Path | None = None,
         nodeid: str | None = None,
+        obj: object = None,
     ) -> None:
         #: A unique name within the scope of the parent node.
         self.name: str = name
@@ -213,6 +214,9 @@ class Node(abc.ABC, metaclass=NodeMeta):
         self.stash: Stash = Stash()
         # Deprecated alias. Was never public. Can be removed in a few releases.
         self._store = self.stash
+
+        # Store the Python object (even if None)
+        self.obj = obj
 
     @classmethod
     def from_parent(cls, parent: Node, **kw) -> Self:
@@ -570,6 +574,7 @@ class FSCollector(Collector, abc.ABC):
         config: Config | None = None,
         session: Session | None = None,
         nodeid: str | None = None,
+        obj: object = None,
     ) -> None:
         if path_or_parent:
             if isinstance(path_or_parent, Node):
@@ -612,6 +617,7 @@ class FSCollector(Collector, abc.ABC):
             session=session,
             nodeid=nodeid,
             path=path,
+            obj=obj,
         )
 
     @classmethod

@@ -132,9 +132,9 @@ def pytest_collect_file(
         if config.option.doctestmodules and not any(
             (_is_setup_py(file_path), _is_main_py(file_path))
         ):
-            return DoctestModule.from_parent(parent, path=file_path)
+            return DoctestModule.from_parent(parent, path=file_path)  # type: ignore[no-any-return]
     elif _is_doctest(config, file_path, parent):
-        return DoctestTextfile.from_parent(parent, path=file_path)
+        return DoctestTextfile.from_parent(parent, path=file_path)  # type: ignore[no-any-return]
     return None
 
 
@@ -418,7 +418,7 @@ def _get_continue_on_failure(config: Config) -> bool:
 
 
 class DoctestTextfile(Module):
-    obj = None
+    obj: None = None  # type: ignore[assignment]
 
     def collect(self) -> Iterable[DoctestItem]:
         import doctest
@@ -544,13 +544,24 @@ class DoctestModule(Module):
                     # Type ignored because this is a private function.
                     return super()._from_module(module, object)  # type: ignore[misc]
 
-        try:
-            module = self.obj
-        except Collector.CollectError:
-            if self.config.getvalue("doctest_ignore_import_errors"):
-                skip(f"unable to import module {self.path!r}")
-            else:
-                raise
+        # Ensure the module is imported (similar to Module.collect)
+        if not hasattr(self, "obj") or self.obj is None:
+            from _pytest.python import importtestmodule
+
+            try:
+                self.obj = importtestmodule(self.path, self.config)
+                # Extract markers from the module after importing
+                if self._ALLOW_MARKERS:
+                    from _pytest.mark.structures import get_unpacked_marks
+
+                    self.own_markers.extend(get_unpacked_marks(self.obj))
+            except Collector.CollectError:
+                if self.config.getvalue("doctest_ignore_import_errors"):
+                    skip(f"unable to import module {self.path!r}")
+                else:
+                    raise
+
+        module = self.obj
 
         # While doctests currently don't support fixtures directly, we still
         # need to pick up autouse fixtures.

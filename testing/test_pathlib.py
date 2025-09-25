@@ -120,6 +120,9 @@ def ns_param(request: pytest.FixtureRequest) -> bool:
     return bool(request.param)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Creating a temporary instance.*:pytest.PytestDeprecationWarning"
+)
 class TestImportPath:
     """
 
@@ -128,6 +131,9 @@ class TestImportPath:
     Having our own pyimport-like function is inline with removing py.path dependency in the future.
     """
 
+    # TODO: The path1 fixture is session-scoped but defined as a method, which requires
+    # creating a temporary instance. This should be refactored to be a standalone
+    # session-scoped fixture instead of a method.
     @pytest.fixture(scope="session")
     def path1(self, tmp_path_factory: TempPathFactory) -> Generator[Path]:
         path = tmp_path_factory.mktemp("path")
