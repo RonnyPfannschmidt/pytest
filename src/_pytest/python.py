@@ -255,16 +255,8 @@ def path_matches_patterns(path: Path, patterns: Iterable[str]) -> bool:
 
 
 def pytest_pycollect_makemodule(module_path: Path, parent) -> Module:
-    # Create the Module and import it immediately so hooks can access mod.obj
+    # Create the Module, but delay import until collect() to preserve error handling
     module: Module = Module.from_parent(parent, path=module_path)
-    # Import the module immediately so obj is available for hooks
-    if not hasattr(module, "obj") or module.obj is None:
-        module.obj = importtestmodule(module.path, module.config)
-        # Extract markers from the module after importing
-        if module._ALLOW_MARKERS:
-            from _pytest.mark.structures import get_unpacked_marks
-
-            module.own_markers.extend(get_unpacked_marks(module.obj))
     return module
 
 
@@ -611,7 +603,32 @@ def importtestmodule(
 class Module(nodes.File, PyCollector):
     """Collector for test classes and functions in a Python module."""
 
-    obj: types.ModuleType
+    _obj: types.ModuleType | None = None
+
+    @property  # type: ignore[override]
+    def obj(self) -> types.ModuleType:
+        """Import and return the module object, caching the result."""
+        # TODO: The type: ignore above is needed because the base class PyobjMixin
+        # declares obj as a simple attribute, not a property. We should refactor
+        # the inheritance hierarchy to handle this properly.
+        if self._obj is None:
+            self._obj = importtestmodule(self.path, self.config)
+            # Extract markers from the module after importing
+            if self._ALLOW_MARKERS:
+                from _pytest.mark.structures import get_unpacked_marks
+
+                self.own_markers.extend(get_unpacked_marks(self._obj))
+        return self._obj
+
+    @obj.setter
+    def obj(self, value: types.ModuleType) -> None:
+        """Allow setting the module object directly."""
+        self._obj = value
+        # Extract markers when obj is set (unless it's None)
+        if value is not None and self._ALLOW_MARKERS:
+            from _pytest.mark.structures import get_unpacked_marks
+
+            self.own_markers.extend(get_unpacked_marks(value))
 
     @classmethod
     def from_parent(cls, parent, *, path: Path | None = None, fspath=None, **kw):
@@ -619,19 +636,13 @@ class Module(nodes.File, PyCollector):
         # Handle both path and fspath for compatibility
         if path is None and fspath is not None:
             path = Path(fspath)
-        # Don't pass obj - Module will import in collect()
+        # Don't pass obj - Module will lazy load it via property
         return super().from_parent(parent=parent, path=path, **kw)
 
     def collect(self) -> Iterable[nodes.Item | nodes.Collector]:
-        # Import the module if not already imported (may be done in pytest_pycollect_makemodule)
-        if not hasattr(self, "obj") or self.obj is None:
-            self.obj = importtestmodule(self.path, self.config)
-            # Extract markers from the module after importing
-            # (since it wasn't passed through constructor)
-            if self._ALLOW_MARKERS:
-                from _pytest.mark.structures import get_unpacked_marks
-
-                self.own_markers.extend(get_unpacked_marks(self.obj))
+        # Access obj property to ensure module is imported
+        # The property will handle importing and marker extraction
+        _ = self.obj
 
         self._register_setup_module_fixture()
         self._register_setup_function_fixture()
