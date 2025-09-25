@@ -160,10 +160,15 @@ def getfuncargnames(
     if not any(p.kind is Parameter.POSITIONAL_ONLY for p in parameters) and (
         # Not using `getattr` because we don't want to resolve the staticmethod.
         # Not using `cls.__dict__` because we want to check the entire MRO.
-        cls
-        and not isinstance(
-            inspect.getattr_static(cls, name, default=None), staticmethod
+        (
+            cls
+            and not isinstance(
+                inspect.getattr_static(cls, name, default=None), staticmethod
+            )
         )
+        or
+        # Handle bound methods (e.g., from plugin instances)
+        hasattr(function, "__self__")
     ):
         arg_names = arg_names[1:]
     # Remove any names that will be replaced with mocks.

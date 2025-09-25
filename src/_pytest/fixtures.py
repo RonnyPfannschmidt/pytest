@@ -946,12 +946,17 @@ def call_fixture_func(
         is_classmethod = getattr(fixturedef, "_is_classmethod", False)
         is_staticmethod = isinstance(fixturedef.func, staticmethod)
 
+        # Check if the function is already a bound method (from a plugin instance)
+        is_bound_method = inspect.ismethod(fixturefunc)
+
         # If it's an instance method but we don't have an instance, we need to provide self
+        # BUT skip this if the method is already bound (from plugin instances)
         if (
             expects_self
             and not is_classmethod
             and not is_staticmethod
             and request.instance is None
+            and not is_bound_method
         ):
             # Get or create an instance for this fixture
             # Look for the class from the fixture's qualname
@@ -2110,7 +2115,26 @@ class FixtureManager:
                 except AttributeError:
                     obj = obj_ub
 
+                # Get the actual function
                 func = obj._get_wrapped_function()
+
+                # For plugin instances (not classes/modules), check if we need a bound method
+                if not safe_isclass(holderobj) and not isinstance(
+                    holderobj, types.ModuleType
+                ):
+                    # This is an instance, not a class or module
+                    # Check if the function is an instance method (not static/class method)
+                    is_inst_method = (
+                        not isinstance(func, staticmethod)
+                        and not isinstance(func, classmethod)
+                        and hasattr(func, "__name__")
+                        and "." in getattr(func, "__qualname__", "")
+                    )
+                    if is_inst_method:
+                        # Create a bound method for this instance
+                        import types as types_module
+
+                        func = types_module.MethodType(func, holderobj)
 
                 # Store whether this is a class method fixture for later handling
                 fixture_kwargs = {
