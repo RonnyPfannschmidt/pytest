@@ -956,7 +956,7 @@ class TestConftestCustomization:
                 pass
             def pytest_pycollect_makeitem(collector, name, obj):
                 if name == "some":
-                    return MyFunction.from_parent(name=name, parent=collector)
+                    return MyFunction.from_parent(name=name, parent=collector, callobj=obj)
         """
         )
         pytester.makepyfile("def some(): pass")
