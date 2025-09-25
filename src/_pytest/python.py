@@ -1740,7 +1740,12 @@ class Function(PyobjMixin, nodes.Item):
     def from_parent(cls, parent, *, callobj=None, **kw) -> Self:
         """The public constructor."""
         if callobj is None:
-            raise ValueError("callobj is required for Function")
+            # Try to get the callable from the parent using the name
+            name = kw.get("name")
+            if name and hasattr(parent, "obj"):
+                callobj = getattr(parent.obj, name, None)
+            if callobj is None:
+                raise ValueError(f"Could not find callobj for {name} in {parent}")
         return super().from_parent(parent=parent, callobj=callobj, **kw)
 
     def _initrequest(self) -> None:
