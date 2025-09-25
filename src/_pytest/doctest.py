@@ -544,13 +544,24 @@ class DoctestModule(Module):
                     # Type ignored because this is a private function.
                     return super()._from_module(module, object)  # type: ignore[misc]
 
-        try:
-            module = self.obj
-        except Collector.CollectError:
-            if self.config.getvalue("doctest_ignore_import_errors"):
-                skip(f"unable to import module {self.path!r}")
-            else:
-                raise
+        # Ensure the module is imported (similar to Module.collect)
+        if not hasattr(self, "obj") or self.obj is None:
+            from _pytest.python import importtestmodule
+
+            try:
+                self.obj = importtestmodule(self.path, self.config)
+                # Extract markers from the module after importing
+                if self._ALLOW_MARKERS:
+                    from _pytest.mark.structures import get_unpacked_marks
+
+                    self.own_markers.extend(get_unpacked_marks(self.obj))
+            except Collector.CollectError:
+                if self.config.getvalue("doctest_ignore_import_errors"):
+                    skip(f"unable to import module {self.path!r}")
+                else:
+                    raise
+
+        module = self.obj
 
         # While doctests currently don't support fixtures directly, we still
         # need to pick up autouse fixtures.

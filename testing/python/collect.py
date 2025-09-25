@@ -76,8 +76,10 @@ class TestModule:
         pytest.raises(modcol.CollectError, modcol.collect)
 
     def test_module_considers_pluginmanager_at_import(self, pytester: Pytester) -> None:
-        modcol = pytester.getmodulecol("pytest_plugins='xasdlkj',")
-        pytest.raises(ImportError, lambda: modcol.obj)
+        # The module import now happens earlier, so we catch it differently
+        pytester.makepyfile("pytest_plugins='xasdlkj',")
+        result = pytester.runpytest()
+        result.stdout.fnmatch_lines(["*ImportError*"])
 
     def test_invalid_test_module_name(self, pytester: Pytester) -> None:
         a = pytester.mkdir("a")

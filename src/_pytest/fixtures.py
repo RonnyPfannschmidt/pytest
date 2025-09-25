@@ -1188,6 +1188,69 @@ def resolve_fixture_function(
     return fixturefunc
 
 
+def _get_fixture_instance(
+    request: FixtureRequest,
+    fixturedef: FixtureDef[Any],
+) -> Any | None:
+    """Get or create an instance for method fixtures.
+
+    For function-scoped fixtures, returns the test instance if available.
+    For other scopes (session, module, class), creates a temporary instance
+    and issues a warning about the deprecated pattern.
+
+    Returns None if no instance can be obtained.
+    """
+    # First try to get the existing instance from the request
+    if hasattr(request, "instance") and request.instance is not None:
+        return request.instance
+
+    # For non-function scoped fixtures that need self, we need to create a fake instance
+    if fixturedef.scope != "function":
+        # Try to find the class that owns this fixture
+        cls = None
+
+        # Check if it's already a bound method
+        if hasattr(fixturedef.func, "__self__"):
+            return fixturedef.func.__self__
+
+        # Try to get the class from parent nodes
+        current = (
+            request._pyfuncitem if hasattr(request, "_pyfuncitem") else request.node
+        )
+        while current is not None:
+            if hasattr(current, "cls") and current.cls is not None:
+                cls = current.cls
+                break
+            current = current.parent
+
+        if cls is not None:
+            # Create a temporary instance and warn with exact location
+            import warnings
+
+            instance = cls()
+
+            # Get the fixture's location for the warning
+            filename = fixturedef.func.__code__.co_filename
+            lineno = fixturedef.func.__code__.co_firstlineno
+
+            from _pytest.warning_types import PytestDeprecationWarning
+
+            warnings.warn_explicit(
+                f"Creating a temporary instance for {fixturedef.scope}-scoped "
+                f"fixture '{fixturedef.argname}' defined as a method in {cls.__name__}. "
+                f"This is deprecated and may lead to unexpected behavior. "
+                f"Consider defining the fixture as a standalone function instead of a method, "
+                f"or change its scope to 'function'.",
+                category=PytestDeprecationWarning,
+                filename=filename,
+                lineno=lineno,
+                module=cls.__module__ if hasattr(cls, "__module__") else None,
+            )
+            return instance
+
+    return None
+
+
 def pytest_fixture_setup(
     fixturedef: FixtureDef[FixtureValue], request: SubRequest
 ) -> FixtureValue:
@@ -1220,10 +1283,11 @@ def pytest_fixture_setup(
     try:
         # If the fixture expects 'self', pass the instance as first arg
         if hasattr(fixturedef, "_expects_self") and fixturedef._expects_self:
-            if hasattr(request, "instance") and request.instance is not None:
+            instance = _get_fixture_instance(request, fixturedef)
+            if instance is not None:
                 # Call with instance as first positional arg
                 if inspect.isgeneratorfunction(fixturefunc):
-                    generator = fixturefunc(request.instance, **kwargs)
+                    generator = fixturefunc(instance, **kwargs)
                     try:
                         result = next(generator)
                     except StopIteration:
@@ -1235,10 +1299,11 @@ def pytest_fixture_setup(
                     )
                     request.addfinalizer(finalizer)
                 else:
-                    result = fixturefunc(request.instance, **kwargs)
+                    result = fixturefunc(instance, **kwargs)
             else:
                 raise RuntimeError(
-                    f"No instance available for method fixture {request.fixturename}"
+                    f"No instance available for method fixture {request.fixturename} "
+                    f"with scope {fixturedef.scope}"
                 )
         else:
             result = call_fixture_func(fixturefunc, request, kwargs)

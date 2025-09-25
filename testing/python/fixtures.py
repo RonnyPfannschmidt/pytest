@@ -1134,6 +1134,9 @@ class TestRequestBasic:
         reprec.assertoutcome(passed=2)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Creating a temporary instance.*:pytest.PytestDeprecationWarning"
+)
 class TestRequestSessionScoped:
     @pytest.fixture(scope="session")
     def session_request(self, request):

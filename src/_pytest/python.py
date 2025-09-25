@@ -255,8 +255,17 @@ def path_matches_patterns(path: Path, patterns: Iterable[str]) -> bool:
 
 
 def pytest_pycollect_makemodule(module_path: Path, parent) -> Module:
-    # Simply create the Module, let it handle importing in collect()
-    return Module.from_parent(parent, path=module_path)  # type: ignore[no-any-return]
+    # Create the Module and import it immediately so hooks can access mod.obj
+    module = Module.from_parent(parent, path=module_path)  # type: ignore[no-any-return]
+    # Import the module immediately so obj is available for hooks
+    if not hasattr(module, "obj") or module.obj is None:
+        module.obj = importtestmodule(module.path, module.config)
+        # Extract markers from the module after importing
+        if module._ALLOW_MARKERS:
+            from _pytest.mark.structures import get_unpacked_marks
+
+            module.own_markers.extend(get_unpacked_marks(module.obj))
+    return module
 
 
 @hookimpl(trylast=True)
@@ -315,6 +324,15 @@ class PyobjMixin(nodes.Node):
 
     _ALLOW_MARKERS = True
     obj: object  # Will be more specific in subclasses
+
+    def __init__(self, *args, obj=None, **kwargs):
+        super().__init__(*args, obj=obj, **kwargs)
+        self.obj = obj
+        # Extract markers from the object if provided and markers are allowed
+        if obj is not None and self._ALLOW_MARKERS:
+            from _pytest.mark.structures import get_unpacked_marks
+
+            self.own_markers.extend(get_unpacked_marks(obj))
 
     @property
     def module(self):
@@ -605,13 +623,15 @@ class Module(nodes.File, PyCollector):
         return super().from_parent(parent=parent, path=path, **kw)
 
     def collect(self) -> Iterable[nodes.Item | nodes.Collector]:
-        # Import the module (this may raise CollectError)
+        # Import the module if not already imported (may be done in pytest_pycollect_makemodule)
         if not hasattr(self, "obj") or self.obj is None:
             self.obj = importtestmodule(self.path, self.config)
-            # After importing, collect marks from the module
-            from _pytest.mark.structures import get_unpacked_marks
+            # Extract markers from the module after importing
+            # (since it wasn't passed through constructor)
+            if self._ALLOW_MARKERS:
+                from _pytest.mark.structures import get_unpacked_marks
 
-            self.own_markers.extend(get_unpacked_marks(self.obj))
+                self.own_markers.extend(get_unpacked_marks(self.obj))
 
         self._register_setup_module_fixture()
         self._register_setup_function_fixture()
