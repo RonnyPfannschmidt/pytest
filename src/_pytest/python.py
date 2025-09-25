@@ -922,14 +922,20 @@ class Class(PyCollector):
 
         def xunit_setup_method_fixture(request) -> Generator[None]:
             instance = request.instance
+            # Get the bound method instead of the unbound function
             method = request.function
+            if instance is not None and hasattr(method, "__name__"):
+                # Try to get the bound method from the instance
+                bound_method = getattr(instance, method.__name__, method)
+            else:
+                bound_method = method
             if setup_method is not None:
                 func = getattr(instance, setup_name)
-                _call_with_optional_argument(func, method)
+                _call_with_optional_argument(func, bound_method)
             yield
             if teardown_method is not None:
                 func = getattr(instance, teardown_name)
-                _call_with_optional_argument(func, method)
+                _call_with_optional_argument(func, bound_method)
 
         assert hasattr(self.obj, "__qualname__")  # Class objects have __qualname__
         self.session._fixturemanager._register_fixture(
