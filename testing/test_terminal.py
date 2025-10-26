@@ -3563,3 +3563,25 @@ class TestTerminalProgressPlugin:
         # Session finish - should remove progress.
         plugin.pytest_sessionfinish()
         assert "\x1b]9;4;0;\x1b\\" in mock_file.getvalue()
+
+
+def test_terminal_reporter_write_with_capture(pytester: Pytester) -> None:
+    """Test that reporter.write() works correctly even with output capture active.
+
+    Regression test for issue #8973.
+    When calling reporter.write() with flush=True during test execution,
+    the output should appear in the terminal even when output capture is active.
+    """
+    pytester.makepyfile(
+        """
+        def test_reporter_write(request):
+            reporter = request.config.pluginmanager.getplugin("terminalreporter")
+            reporter.ensure_newline()
+            reporter.write("CUSTOM_OUTPUT", flush=True)
+            assert True
+        """
+    )
+    result = pytester.runpytest("-v")
+    # The custom output should appear in the captured output
+    result.stdout.fnmatch_lines(["*CUSTOM_OUTPUT*"])
+    result.assert_outcomes(passed=1)
