@@ -1043,6 +1043,12 @@ class AssertionRewriter(ast.NodeVisitor):
         return res, explanation
 
     def visit_Call(self, call: ast.Call) -> tuple[ast.Name, str]:
+        # For method calls (obj.method()), produce a flat explanation like
+        # "where result = obj.method(args)" instead of nesting the attribute
+        # access as a separate "where method = obj.method" line.
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.ctx, ast.Load):
+            return self._visit_method_call(call)
+
         new_func, func_expl = self.visit(call.func)
         arg_expls = []
         new_args = []
@@ -1066,11 +1072,79 @@ class AssertionRewriter(ast.NodeVisitor):
         outer_expl = f"{res_expl}\n{{{res_expl} = {expl}\n}}"
         return res, outer_expl
 
+    def _visit_method_call(self, call: ast.Call) -> tuple[ast.Name, str]:
+        r"""Handle obj.method(...) calls with a flat explanation format.
+
+        Produces: "result\n{result = obj_repr.method(args)\n}"
+        instead of nesting the bound-method intermediate.
+        """
+        attr = call.func
+        assert isinstance(attr, ast.Attribute)
+
+        # Visit the object (receiver) for introspection.
+        obj_res, obj_expl = self.visit(attr.value)
+
+        # Visit arguments.
+        arg_expls = []
+        new_args = []
+        new_kwargs = []
+        for arg in call.args:
+            res, expl = self.visit(arg)
+            arg_expls.append(expl)
+            new_args.append(res)
+        for keyword in call.keywords:
+            res, expl = self.visit(keyword.value)
+            new_kwargs.append(ast.keyword(keyword.arg, res))
+            if keyword.arg:
+                arg_expls.append(keyword.arg + "=" + expl)
+            else:
+                arg_expls.append("**" + expl)
+
+        # Build the call using the rewritten object's attribute.
+        new_func = ast.Attribute(obj_res, attr.attr, ast.Load())
+        new_call = ast.copy_location(ast.Call(new_func, new_args, new_kwargs), call)
+        res = self.assign(new_call)
+        res_expl = self.explanation_param(self.display(res))
+        args_str = ", ".join(arg_expls)
+        expl = f"{res_expl}\n{{{res_expl} = {obj_expl}.{attr.attr}({args_str})\n}}"
+        return res, expl
+
     def visit_Starred(self, starred: ast.Starred) -> tuple[ast.Starred, str]:
         # A Starred node can appear in a function call.
         res, expl = self.visit(starred.value)
         new_starred = ast.Starred(res, starred.ctx)
         return new_starred, "*" + expl
+
+    def visit_IfExp(self, ifexp: ast.IfExp) -> tuple[ast.Name, str]:
+        # Introspect the condition but keep branches as-is to preserve
+        # short-circuit semantics (only the selected branch is evaluated).
+        cond_res, cond_expl = self.visit(ifexp.test)
+        # Reconstruct the IfExp with the rewritten condition but original
+        # branches to avoid evaluating both sides.
+        res = self.assign(
+            ast.copy_location(ast.IfExp(cond_res, ifexp.body, ifexp.orelse), ifexp)
+        )
+        res_expl = self.explanation_param(self.display(res))
+        pat = "%s\n{%s = (... if %s else ...)\n}"
+        expl = pat % (res_expl, res_expl, cond_expl)
+        return res, expl
+
+    def visit_Subscript(self, subscript: ast.Subscript) -> tuple[ast.Name, str]:
+        if not isinstance(subscript.ctx, ast.Load):
+            return self.generic_visit(subscript)
+        # For Slice objects (a[1:3]), fall back to generic — decomposing
+        # start/stop/step is rarely useful in assertion messages.
+        if isinstance(subscript.slice, ast.Slice):
+            return self.generic_visit(subscript)
+        value, value_expl = self.visit(subscript.value)
+        slice_res, slice_expl = self.visit(subscript.slice)
+        res = self.assign(
+            ast.copy_location(ast.Subscript(value, slice_res, ast.Load()), subscript)
+        )
+        res_expl = self.explanation_param(self.display(res))
+        pat = "%s\n{%s = %s[%s]\n}"
+        expl = pat % (res_expl, res_expl, value_expl, slice_expl)
+        return res, expl
 
     def visit_Attribute(self, attr: ast.Attribute) -> tuple[ast.Name, str]:
         if not isinstance(attr.ctx, ast.Load):
