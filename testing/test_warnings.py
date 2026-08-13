@@ -735,7 +735,7 @@ def test_group_warnings_by_message_summary(pytester: Pytester) -> None:
     )
 
 
-def test_pytest_configure_warning(tmp_path: Path, recwarn) -> None:
+def test_pytest_configure_warning(tmp_path: Path) -> None:
     """Issue 5115."""
 
     class ConfigureWarner:
@@ -744,16 +744,21 @@ def test_pytest_configure_warning(tmp_path: Path, recwarn) -> None:
         def pytest_configure(self):
             warnings.warn("from pytest_configure")
 
-    # A warning issued from ``pytest_configure`` is not recorded (the config
-    # catches those without recording), but it must not blow the run up
-    # either; the original's ``ret == 5`` was "no tests collected, no
-    # internal error".
+    # A warning issued from ``pytest_configure`` must not blow the run up -
+    # the original's ``ret == 5`` was "no tests collected, no internal
+    # error" - and it must be reported by the ensemble rather than escaping
+    # into whatever is running it. The ini filter is what makes it a warning
+    # rather than an error: absent one, the ensemble inherits this suite's
+    # ``filterwarnings = error``.
     record = run_tests(
-        spec=ConfigSpec(rootpath=tmp_path, extra_plugins=(ConfigureWarner(),))
+        spec=ConfigSpec(
+            rootpath=tmp_path,
+            extra_plugins=(ConfigureWarner(),),
+            inicfg={"filterwarnings": ["always"]},
+        )
     )
     record.assert_outcomes()
-    warning = recwarn.pop()
-    assert str(warning.message) == "from pytest_configure"
+    assert [str(w.message) for w in record.warnings] == ["from pytest_configure"]
 
 
 @pytest.mark.parametrize("tryfirst", [True, False])
