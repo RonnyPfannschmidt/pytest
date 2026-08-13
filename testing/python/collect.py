@@ -8,7 +8,6 @@ import textwrap
 from typing import Any
 
 import _pytest._code
-from _pytest.config import ExitCode
 from _pytest.config.exceptions import UsageError
 from _pytest.ensemble import build_module
 from _pytest.ensemble import collect_tests
@@ -453,7 +452,7 @@ class TestFunction:
             "1.2.2a1": {"tag": "release-1.2.2a1"},
         }
 
-        @pytest.mark.parametrize("key value".split(), archival_mapping.items())
+        @pytest.mark.parametrize(["key", "value"], archival_mapping.items())
         def test_archival_to_version(key, value):
             assert key in archival_mapping
             assert value == archival_mapping[key]
@@ -478,7 +477,7 @@ class TestFunction:
             return request.param
 
         @pytest.mark.parametrize(
-            "key value".split(), archival_mapping.items(), indirect=True
+            ["key", "value"], archival_mapping.items(), indirect=True
         )
         def test_archival_to_version(key, value):
             assert key in archival_mapping
