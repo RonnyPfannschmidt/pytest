@@ -3048,11 +3048,11 @@ class TestFixtureMarker:
 
     def test_module_parametrized_ordering(self, tmp_path: Path) -> None:
         class ConftestPlugin:
-            @pytest.fixture(scope="session", params="s1 s2".split())
+            @pytest.fixture(scope="session", params=["s1", "s2"])
             def sarg(self):
                 pass
 
-            @pytest.fixture(scope="module", params="m1 m2".split())
+            @pytest.fixture(scope="module", params=["m1", "m2"])
             def marg(self):
                 pass
 
