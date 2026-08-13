@@ -20,6 +20,12 @@ from _pytest._io.wcwidth import wcswidth
 import _pytest.config
 from _pytest.config import Config
 from _pytest.config import ExitCode
+from _pytest.ensemble import build_module
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import Ensemble
+from _pytest.ensemble import run_tests
+from _pytest.mark.structures import Mark
+from _pytest.mark.structures import MarkDecorator
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.pytester import Pytester
 from _pytest.reports import BaseReport
@@ -35,6 +41,16 @@ from _pytest.terminal import getreportopt
 from _pytest.terminal import TerminalProgressPlugin
 from _pytest.terminal import TerminalReporter
 import pytest
+
+
+def unregistered_mark(name: str, *args: object, **kwargs: object) -> MarkDecorator:
+    """Build a mark decorator without consulting the host configuration.
+
+    ``pytest.mark.<name>`` resolves against the *host* config at decoration
+    time, and this suite runs with strict markers, so a deliberately
+    unregistered mark applied to an ensemble source has to be built directly.
+    """
+    return MarkDecorator(Mark(name, args, kwargs, _ispytest=True), _ispytest=True)
 
 
 class DistInfo(NamedTuple):
@@ -86,21 +102,28 @@ def test_plugin_nameversion(input, expected):
 
 
 class TestTerminal:
-    def test_pass_skip_fail(self, pytester: Pytester, option) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def test_ok():
-                pass
-            def test_skip():
-                pytest.skip("xx")
-            def test_func():
-                assert 0
-        """
+    def test_pass_skip_fail(self, tmp_path: Path, option) -> None:
+        def test_ok():
+            pass
+
+        def test_skip():
+            pytest.skip("xx")
+
+        def test_func():
+            assert 0
+
+        spec = ConfigSpec(rootpath=tmp_path, args=tuple(option.args))
+        record = run_tests(
+            test_ok,
+            test_skip,
+            test_func,
+            spec=spec,
+            name="test_pass_skip_fail",
+            capture_output=True,
         )
-        result = pytester.runpytest(*option.args)
+        record.assert_outcomes(passed=1, skipped=1, failed=1)
         if option.verbosity > 0:
-            result.stdout.fnmatch_lines(
+            record.stdout.fnmatch_lines(
                 [
                     "*test_pass_skip_fail.py::test_ok PASS*",
                     "*test_pass_skip_fail.py::test_skip SKIP*",
@@ -108,13 +131,17 @@ class TestTerminal:
                 ]
             )
         elif option.verbosity == 0:
-            result.stdout.fnmatch_lines(["*test_pass_skip_fail.py .sF*"])
+            record.stdout.fnmatch_lines(["*test_pass_skip_fail.py .sF*"])
         else:
-            result.stdout.fnmatch_lines([".sF*"])
-        result.stdout.fnmatch_lines(
+            record.stdout.fnmatch_lines([".sF*"])
+        record.stdout.fnmatch_lines(
             ["    def test_func():", ">       assert 0", "E       assert 0"]
         )
 
+    # ensemble: `console_output_style=times` needs the progress column, which
+    # only appears once capturing is active and the run goes through
+    # `pytest_runtestloop` - an ensemble has neither, so the code path this
+    # regression test exercises would never run.
     def test_console_output_style_times_with_skipped_and_passed(
         self, pytester: Pytester
     ) -> None:
@@ -140,34 +167,57 @@ class TestTerminal:
         combined = "\n".join(result.stdout.lines + result.stderr.lines)
         assert "INTERNALERROR" not in combined
 
-    def test_internalerror(self, pytester: Pytester, linecomp) -> None:
-        modcol = pytester.getmodulecol("def test_one(): pass")
-        rep = TerminalReporter(modcol.config, file=linecomp.stringio)
-        with pytest.raises(ValueError) as excinfo:
-            raise ValueError("hello")
-        rep.pytest_internalerror(excinfo.getrepr())
+    def test_internalerror(self, tmp_path: Path, linecomp) -> None:
+        def test_one():
+            pass
+
+        with Ensemble(test_one, rootpath=tmp_path, capture_output=True) as ensemble:
+            rep = TerminalReporter(ensemble.config, file=linecomp.stringio)
+            with pytest.raises(ValueError) as excinfo:
+                raise ValueError("hello")
+            rep.pytest_internalerror(excinfo.getrepr())
         linecomp.assert_contains_lines(["INTERNALERROR> *ValueError*hello*"])
 
-    def test_writeline(self, pytester: Pytester, linecomp) -> None:
-        modcol = pytester.getmodulecol("def test_one(): pass")
-        rep = TerminalReporter(modcol.config, file=linecomp.stringio)
-        rep.write_fspath_result(modcol.nodeid, ".")
-        rep.write_line("hello world")
-        lines = linecomp.stringio.getvalue().split("\n")
-        assert not lines[0]
-        assert lines[1].endswith(modcol.name + " .")
-        assert lines[2] == "hello world"
+    def test_writeline(self, tmp_path: Path, linecomp) -> None:
+        def test_one():
+            pass
 
-    def test_show_runtest_logstart(self, pytester: Pytester, linecomp) -> None:
-        item = pytester.getitem("def test_func(): pass")
-        tr = TerminalReporter(item.config, file=linecomp.stringio)
-        item.config.pluginmanager.register(tr)
-        location = item.reportinfo()
-        tr.config.hook.pytest_runtest_logstart(
-            nodeid=item.nodeid, location=location, fspath=str(item.path)
-        )
+        with Ensemble(
+            test_one, rootpath=tmp_path, name="test_writeline", capture_output=True
+        ) as ensemble:
+            (item,) = ensemble.collect()
+            modcol = item.parent
+            assert modcol is not None
+            rep = TerminalReporter(ensemble.config, file=linecomp.stringio)
+            rep.write_fspath_result(modcol.nodeid, ".")
+            rep.write_line("hello world")
+            lines = linecomp.stringio.getvalue().split("\n")
+            assert not lines[0]
+            assert lines[1].endswith(modcol.name + " .")
+            assert lines[2] == "hello world"
+
+    def test_show_runtest_logstart(self, tmp_path: Path, linecomp) -> None:
+        def test_func():
+            pass
+
+        with Ensemble(
+            test_func,
+            rootpath=tmp_path,
+            name="test_show_runtest_logstart",
+            capture_output=True,
+        ) as ensemble:
+            (item,) = ensemble.collect()
+            tr = TerminalReporter(item.config, file=linecomp.stringio)
+            item.config.pluginmanager.register(tr)
+            location = item.reportinfo()
+            tr.config.hook.pytest_runtest_logstart(
+                nodeid=item.nodeid, location=location, fspath=str(item.path)
+            )
+            item.config.pluginmanager.unregister(tr)
         linecomp.assert_contains_lines(["*test_show_runtest_logstart.py*"])
 
+    # ensemble: drives a real pytest through a pty to watch output appear
+    # before the test finishes.
     def test_runtest_location_shown_before_test_starts(
         self, pytester: Pytester
     ) -> None:
@@ -183,6 +233,7 @@ class TestTerminal:
         child.sendeof()
         child.kill(15)
 
+    # ensemble: drives a real pytest through a pty.
     def test_report_collect_after_half_a_second(
         self, pytester: Pytester, monkeypatch: MonkeyPatch
     ) -> None:
@@ -211,6 +262,10 @@ class TestTerminal:
         rest = child.read().decode("utf8")
         assert "= \x1b[32m\x1b[1m2 passed\x1b[0m\x1b[32m in" in rest
 
+    # ensemble: asserts the `<- test_p1.py` suffix, which is derived from the
+    # item's reportinfo. Ensemble items report the *host* file, so every
+    # ensemble item would carry that suffix at -vv and none of these lines
+    # would match.
     def test_itemreport_subclasses_show_subclassed_file(
         self, pytester: Pytester
     ) -> None:
@@ -264,6 +319,9 @@ class TestTerminal:
             ]
         )
 
+    # ensemble: asserts `no_fnmatch_line("* <- *")`, which an ensemble can
+    # never satisfy - the item's reportinfo is the host file, so -vv always
+    # renders a `<- .../test_terminal.py` suffix.
     def test_itemreport_directclasses_not_shown_as_subclasses(
         self, pytester: Pytester
     ) -> None:
@@ -283,6 +341,8 @@ class TestTerminal:
         result.stdout.fnmatch_lines(["*a123/test_hello123.py*PASS*"])
         result.stdout.no_fnmatch_line("* <- *")
 
+    # ensemble: KeyboardInterrupt reporting is done by `wrap_session`, which
+    # an ensemble never enters.
     @pytest.mark.parametrize("fulltrace", ("", "--fulltrace"))
     def test_keyboard_interrupt(self, pytester: Pytester, fulltrace) -> None:
         pytester.makepyfile(
@@ -315,6 +375,8 @@ class TestTerminal:
             )
         result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
 
+    # ensemble: asserts the exit code of an interrupted session; interrupt
+    # handling lives in `wrap_session`.
     def test_keyboard_in_sessionstart(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -333,27 +395,30 @@ class TestTerminal:
         assert result.ret == 2
         result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
 
-    def test_collect_single_item(self, pytester: Pytester) -> None:
+    def test_collect_single_item(self, tmp_path: Path) -> None:
         """Use singular 'item' when reporting a single test item"""
-        pytester.makepyfile(
-            """
-            def test_foobar():
-                pass
-        """
-        )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["collected 1 item"])
 
-    def test_rewrite(self, pytester: Pytester, monkeypatch) -> None:
-        config = pytester.parseconfig()
-        f = StringIO()
-        monkeypatch.setattr(f, "isatty", lambda *args: True)
-        tr = TerminalReporter(config, f)
-        tr._tw.fullwidth = 10
-        tr.write("hello")
-        tr.rewrite("hey", erase=True)
-        assert f.getvalue() == "hello" + "\r" + "hey" + (6 * " ")
+        def test_foobar():
+            pass
 
+        record = run_tests(test_foobar, rootpath=tmp_path, capture_output=True)
+        record.assert_outcomes(passed=1)
+        record.stdout.fnmatch_lines(["collected 1 item"])
+
+    def test_rewrite(self, tmp_path: Path, monkeypatch) -> None:
+        with Ensemble(rootpath=tmp_path, capture_output=True) as ensemble:
+            config = ensemble.config
+            f = StringIO()
+            monkeypatch.setattr(f, "isatty", lambda *args: True)
+            tr = TerminalReporter(config, f)
+            tr._tw.fullwidth = 10
+            tr.write("hello")
+            tr.rewrite("hey", erase=True)
+            assert f.getvalue() == "hello" + "\r" + "hey" + (6 * " ")
+
+    # ensemble: `assert not result.stderr.lines` has no in-process equivalent -
+    # an ensemble renders to a single buffer and has no stderr of its own - so
+    # porting would drop half of what this test checks.
     @pytest.mark.parametrize("category", ["foo", "failed", "error", "passed"])
     def test_report_teststatus_explicit_markup(
         self, monkeypatch: MonkeyPatch, pytester: Pytester, color_mapping, category: str
@@ -380,6 +445,9 @@ class TestTerminal:
             color_mapping.format_for_fnmatch(["*{red}FOO{reset}*"])
         )
 
+    # ensemble: the -vv half asserts on lines that, for an ensemble item, gain
+    # a `<- .../test_terminal.py` suffix from the host-anchored reportinfo,
+    # which also shifts where the skip reason gets wrapped.
     def test_verbose_skip_reason(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             """
@@ -471,16 +539,21 @@ class TestTerminal:
         )
 
     @pytest.mark.parametrize("isatty", [True, False])
-    def test_isatty(self, pytester: Pytester, monkeypatch, isatty: bool) -> None:
-        config = pytester.parseconfig()
-        f = StringIO()
-        monkeypatch.setattr(f, "isatty", lambda: isatty)
-        tr = TerminalReporter(config, f)
-        assert tr.isatty() == isatty
-        # It was incorrectly implemented as a boolean so we still support using it as one.
-        assert bool(tr.isatty) == isatty
+    def test_isatty(self, tmp_path: Path, monkeypatch, isatty: bool) -> None:
+        with Ensemble(rootpath=tmp_path, capture_output=True) as ensemble:
+            config = ensemble.config
+            f = StringIO()
+            monkeypatch.setattr(f, "isatty", lambda: isatty)
+            tr = TerminalReporter(config, f)
+            assert tr.isatty() == isatty
+            # It was incorrectly implemented as a boolean so we still support using it as one.
+            assert bool(tr.isatty) == isatty
 
 
+# ensemble: every test below asserts the rendering of `--collect-only`, which
+# is served from `pytest_cmdline_main`. An ensemble never reaches that path:
+# it still runs the collected items, and its collection tree renders as
+# `<EnsembleModule ...>` with no enclosing `<Dir ...>`.
 class TestCollectonly:
     def test_collectonly_basic(self, pytester: Pytester) -> None:
         pytester.makepyfile(
@@ -652,6 +725,9 @@ class TestCollectonly:
         )
 
 
+# ensemble: every test below asserts on a `Captured stdout` section. Capture
+# is process-global state an ensemble deliberately does not install, so no
+# captured-output section is ever rendered.
 class TestFixtureReporting:
     def test_setup_fixture_error(self, pytester: Pytester) -> None:
         pytester.makepyfile(
@@ -753,84 +829,101 @@ class TestFixtureReporting:
 
 
 class TestTerminalFunctional:
-    def test_deselected(self, pytester: Pytester) -> None:
-        testpath = pytester.makepyfile(
-            """
-                def test_one():
-                    pass
-                def test_two():
-                    pass
-                def test_three():
-                    pass
-           """
+    def test_deselected(self, tmp_path: Path) -> None:
+        def test_one():
+            pass
+
+        def test_two():
+            pass
+
+        def test_three():
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-k", "test_t"))
+        record = run_tests(
+            test_one,
+            test_two,
+            test_three,
+            spec=spec,
+            name="test_deselected",
+            capture_output=True,
         )
-        result = pytester.runpytest("-k", "test_t", testpath)
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             ["collected 3 items / 1 deselected / 2 selected", "*test_deselected.py ..*"]
         )
-        assert result.ret == 0
+        # Stronger than the original `ret == 0`.
+        record.assert_outcomes(passed=2, deselected=1)
 
-    def test_deselected_with_hook_wrapper(self, pytester: Pytester) -> None:
-        pytester.makeconftest(
-            """
-            import pytest
-
+    def test_deselected_with_hook_wrapper(self, tmp_path: Path) -> None:
+        class DeselectLastPlugin:
             @pytest.hookimpl(wrapper=True)
-            def pytest_collection_modifyitems(config, items):
+            def pytest_collection_modifyitems(self, config, items):
                 yield
                 deselected = items.pop()
                 config.hook.pytest_deselected(items=[deselected])
-            """
+
+        def test_one():
+            pass
+
+        def test_two():
+            pass
+
+        def test_three():
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, extra_plugins=(DeselectLastPlugin(),))
+        record = run_tests(
+            test_one,
+            test_two,
+            test_three,
+            spec=spec,
+            name="test_deselected_hook",
+            capture_output=True,
         )
-        testpath = pytester.makepyfile(
-            """
-                def test_one():
-                    pass
-                def test_two():
-                    pass
-                def test_three():
-                    pass
-           """
-        )
-        result = pytester.runpytest(testpath)
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 3 items / 1 deselected / 2 selected",
                 "*= 2 passed, 1 deselected in*",
             ]
         )
-        assert result.ret == 0
+        record.assert_outcomes(passed=2, deselected=1)
 
     def test_show_deselected_items_using_markexpr_before_test_execution(
-        self, pytester: Pytester
+        self, tmp_path: Path
     ) -> None:
-        pytester.makepyfile(
-            test_show_deselected="""
-            import pytest
+        @unregistered_mark("foo")
+        def test_foobar():
+            pass
 
-            @pytest.mark.foo
-            def test_foobar():
-                pass
+        @unregistered_mark("bar")
+        def test_bar():
+            pass
 
-            @pytest.mark.bar
-            def test_bar():
-                pass
+        def test_pass():
+            pass
 
-            def test_pass():
-                pass
-        """
+        spec = ConfigSpec(rootpath=tmp_path, args=("-m", "not foo"))
+        record = run_tests(
+            test_foobar,
+            test_bar,
+            test_pass,
+            spec=spec,
+            name="test_show_deselected",
+            capture_output=True,
         )
-        result = pytester.runpytest("-m", "not foo")
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 3 items / 1 deselected / 2 selected",
                 "*test_show_deselected.py ..*",
                 "*= 2 passed, 1 deselected in * =*",
             ]
         )
-        result.stdout.no_fnmatch_line("*= 1 deselected =*")
-        assert result.ret == 0
+        record.stdout.no_fnmatch_line("*= 1 deselected =*")
+        record.assert_outcomes(passed=2, deselected=1)
 
+    # ensemble: the `! Interrupted: ... !` line and the interrupted exit code
+    # come from `wrap_session`, and the collection error needs a module that
+    # blows up on import.
     def test_selected_count_with_error(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             test_selected_count_3="""
@@ -858,41 +951,48 @@ class TestTerminalFunctional:
         )
         assert result.ret == ExitCode.INTERRUPTED
 
-    def test_no_skip_summary_if_failure(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def test_ok():
-                pass
-            def test_fail():
-                assert 0
-            def test_skip():
-                pytest.skip("dontshow")
-        """
-        )
-        result = pytester.runpytest()
-        assert result.stdout.str().find("skip test summary") == -1
-        assert result.ret == 1
+    def test_no_skip_summary_if_failure(self, tmp_path: Path) -> None:
+        def test_ok():
+            pass
 
-    def test_passes(self, pytester: Pytester) -> None:
-        p1 = pytester.makepyfile(
-            """
-            def test_passes():
-                pass
-            class TestClass(object):
-                def test_method(self):
-                    pass
-        """
-        )
-        old = p1.parent
-        pytester.chdir()
-        try:
-            result = pytester.runpytest()
-        finally:
-            os.chdir(old)
-        result.stdout.fnmatch_lines(["test_passes.py ..*", "* 2 pass*"])
-        assert result.ret == 0
+        def test_fail():
+            assert 0
 
+        def test_skip():
+            pytest.skip("dontshow")
+
+        record = run_tests(
+            test_ok,
+            test_fail,
+            test_skip,
+            rootpath=tmp_path,
+            name="test_no_skip_summary_if_failure",
+            capture_output=True,
+        )
+        assert record.output.find("skip test summary") == -1
+        # Stronger than the original `ret == 1`.
+        record.assert_outcomes(passed=1, failed=1, skipped=1)
+
+    def test_passes(self, tmp_path: Path) -> None:
+        def test_passes():
+            pass
+
+        class TestClass:
+            def test_method(self):
+                pass
+
+        record = run_tests(
+            test_passes,
+            TestClass,
+            rootpath=tmp_path,
+            name="test_passes",
+            capture_output=True,
+        )
+        record.stdout.fnmatch_lines(["test_passes.py ..*", "* 2 pass*"])
+        record.assert_outcomes(passed=2)
+
+    # ensemble: the header block differs - an ensemble has no `plugins:` line
+    # and its rootdir is a throwaway tmp path.
     def test_header_trailer_info(
         self, monkeypatch: MonkeyPatch, pytester: Pytester, request
     ) -> None:
@@ -917,6 +1017,8 @@ class TestTerminalFunctional:
         if request.config.pluginmanager.list_plugin_distinfo():
             result.stdout.fnmatch_lines(["plugins: *"])
 
+    # ensemble: an ensemble never renders a `plugins:` line, so the
+    # `no_fnmatch_line("plugins: *")` half would hold for the wrong reason.
     def test_no_header_trailer_info(
         self, monkeypatch: MonkeyPatch, pytester: Pytester, request
     ) -> None:
@@ -935,6 +1037,8 @@ class TestTerminalFunctional:
         if request.config.pluginmanager.list_plugin_distinfo():
             result.stdout.no_fnmatch_line("plugins: *")
 
+    # ensemble: asserts `configfile:`/`testpaths:` header lines; ensemble
+    # configs are built from data and never read a config file.
     def test_header(self, pytester: Pytester) -> None:
         pytester.path.joinpath("tests").mkdir()
         pytester.path.joinpath("gui").mkdir()
@@ -964,6 +1068,7 @@ class TestTerminalFunctional:
         result = pytester.runpytest("tests")
         result.stdout.fnmatch_lines(["rootdir: *test_header0", "configfile: tox.ini"])
 
+    # ensemble: asserts `configfile:`/`testpaths:` header lines.
     def test_header_absolute_testpath(
         self, pytester: Pytester, monkeypatch: MonkeyPatch
     ) -> None:
@@ -985,6 +1090,8 @@ class TestTerminalFunctional:
             ]
         )
 
+    # ensemble: asserts on `inifile:`/`testpaths:` header lines, which an
+    # ensemble never renders in the first place.
     def test_no_header(self, pytester: Pytester) -> None:
         pytester.path.joinpath("tests").mkdir()
         pytester.path.joinpath("gui").mkdir()
@@ -1005,42 +1112,49 @@ class TestTerminalFunctional:
         result = pytester.runpytest("tests", "--no-header")
         result.stdout.no_fnmatch_line("rootdir: *test_header0, inifile: tox.ini")
 
-    def test_no_summary(self, pytester: Pytester) -> None:
-        p1 = pytester.makepyfile(
-            """
-            def test_no_summary():
-                assert false
-        """
-        )
-        result = pytester.runpytest(p1, "--no-summary")
-        result.stdout.no_fnmatch_line("*= FAILURES =*")
+    def test_no_summary(self, tmp_path: Path) -> None:
+        def test_no_summary():
+            # Deliberately undefined, as in the original: the test only cares
+            # that the test fails and that no FAILURES section is rendered.
+            assert false  # type: ignore[name-defined]  # noqa: F821
 
-    def test_no_summary_still_runs_terminal_summary_hook(
-        self, pytester: Pytester
-    ) -> None:
+        spec = ConfigSpec(rootpath=tmp_path, args=("--no-summary",))
+        record = run_tests(
+            test_no_summary, spec=spec, name="test_no_summary", capture_output=True
+        )
+        record.stdout.no_fnmatch_line("*= FAILURES =*")
+        record.assert_outcomes(failed=1)
+
+    def test_no_summary_still_runs_terminal_summary_hook(self, tmp_path: Path) -> None:
         """--no-summary must not skip pytest_terminal_summary for plugins (#14724)."""
-        pytester.makeconftest(
-            """
-            def pytest_terminal_summary(terminalreporter, exitstatus, config):
-                terminalreporter.write_line("PLUGIN_TERMINAL_SUMMARY_RAN")
-            """
-        )
-        p1 = pytester.makepyfile("def test_ok(): assert True")
-        result = pytester.runpytest(p1, "--no-summary")
-        result.stdout.fnmatch_lines(["PLUGIN_TERMINAL_SUMMARY_RAN"])
-        result.stdout.no_fnmatch_line("*= FAILURES =*")
 
-    def test_showlocals(self, pytester: Pytester) -> None:
-        p1 = pytester.makepyfile(
-            """
-            def test_showlocals():
-                x = 3
-                y = "x" * 5000
-                assert 0
-        """
+        class SummaryPlugin:
+            def pytest_terminal_summary(self, terminalreporter, exitstatus, config):
+                terminalreporter.write_line("PLUGIN_TERMINAL_SUMMARY_RAN")
+
+        def test_ok():
+            assert True
+
+        spec = ConfigSpec(
+            rootpath=tmp_path,
+            args=("--no-summary",),
+            extra_plugins=(SummaryPlugin(),),
         )
-        result = pytester.runpytest(p1, "-l")
-        result.stdout.fnmatch_lines(
+        record = run_tests(test_ok, spec=spec, capture_output=True)
+        record.stdout.fnmatch_lines(["PLUGIN_TERMINAL_SUMMARY_RAN"])
+        record.stdout.no_fnmatch_line("*= FAILURES =*")
+
+    def test_showlocals(self, tmp_path: Path) -> None:
+        def test_showlocals():
+            x = 3  # noqa: F841
+            y = "x" * 5000  # noqa: F841
+            assert 0
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-l",))
+        record = run_tests(
+            test_showlocals, spec=spec, name="test_showlocals", capture_output=True
+        )
+        record.stdout.fnmatch_lines(
             [
                 # "_ _ * Locals *",
                 "x* = 3",
@@ -1048,22 +1162,29 @@ class TestTerminalFunctional:
             ]
         )
 
-    def test_noshowlocals_addopts_override(self, pytester: Pytester) -> None:
-        pytester.makeini("[pytest]\naddopts=--showlocals")
-        p1 = pytester.makepyfile(
-            """
-            def test_noshowlocals():
-                x = 3
-                y = "x" * 5000
-                assert 0
-        """
-        )
+    def test_noshowlocals_addopts_override(self, tmp_path: Path) -> None:
+        def test_noshowlocals():
+            x = 3  # noqa: F841
+            y = "x" * 5000  # noqa: F841
+            assert 0
 
         # Override global --showlocals for py.test via arg
-        result = pytester.runpytest(p1, "--no-showlocals")
-        result.stdout.no_fnmatch_line("x* = 3")
-        result.stdout.no_fnmatch_line("y* = 'xxxxxx*")
+        spec = ConfigSpec(
+            rootpath=tmp_path,
+            inicfg={"addopts": "--showlocals"},
+            args=("--no-showlocals",),
+        )
+        record = run_tests(
+            test_noshowlocals,
+            spec=spec,
+            name="test_noshowlocals",
+            capture_output=True,
+        )
+        record.stdout.no_fnmatch_line("x* = 3")
+        record.stdout.no_fnmatch_line("y* = 'xxxxxx*")
 
+    # ensemble: `--tb=short` renders the crash location as `<file>:<lineno>`,
+    # and an ensemble item's file is the host `test_terminal.py`.
     def test_showlocals_short(self, pytester: Pytester) -> None:
         p1 = pytester.makepyfile(
             """
@@ -1099,19 +1220,39 @@ class TestTerminalFunctional:
         """
         )
 
-    def test_verbose_reporting(self, verbose_testfile, pytester: Pytester) -> None:
-        result = pytester.runpytest(
-            verbose_testfile, "-v", "-Walways::pytest.PytestWarning"
+    def test_verbose_reporting(self, tmp_path: Path) -> None:
+        def test_fail():
+            raise ValueError
+
+        def test_pass():
+            pass
+
+        class TestClass:
+            def test_skip(self):
+                pytest.skip("hello")
+
+        spec = ConfigSpec(
+            rootpath=tmp_path, args=("-v", "-Walways::pytest.PytestWarning")
         )
-        result.stdout.fnmatch_lines(
+        record = run_tests(
+            test_fail,
+            test_pass,
+            TestClass,
+            spec=spec,
+            name="test_verbose_reporting",
+            capture_output=True,
+        )
+        record.stdout.fnmatch_lines(
             [
                 "*test_verbose_reporting.py::test_fail *FAIL*",
                 "*test_verbose_reporting.py::test_pass *PASS*",
                 "*test_verbose_reporting.py::TestClass::test_skip *SKIP*",
             ]
         )
-        assert result.ret == 1
+        # Stronger than the original `ret == 1`.
+        record.assert_outcomes(passed=1, failed=1, skipped=1)
 
+    # ensemble: runs the ensemble's tests through xdist workers.
     def test_verbose_reporting_xdist(
         self,
         verbose_testfile,
@@ -1131,58 +1272,70 @@ class TestTerminalFunctional:
         )
         assert result.ret == 1
 
-    def test_quiet_reporting(self, pytester: Pytester) -> None:
-        p1 = pytester.makepyfile("def test_pass(): pass")
-        result = pytester.runpytest(p1, "-q")
-        s = result.stdout.str()
+    def test_quiet_reporting(self, tmp_path: Path) -> None:
+        def test_pass():
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-q",))
+        record = run_tests(
+            test_pass, spec=spec, name="test_quiet_reporting", capture_output=True
+        )
+        s = record.output
         assert "test session starts" not in s
-        assert p1.name not in s
+        assert "test_quiet_reporting.py" not in s
         assert "===" not in s
         assert "passed" in s
 
-    def test_more_quiet_reporting(self, pytester: Pytester) -> None:
-        p1 = pytester.makepyfile("def test_pass(): pass")
-        result = pytester.runpytest(p1, "-qq")
-        s = result.stdout.str()
+    def test_more_quiet_reporting(self, tmp_path: Path) -> None:
+        def test_pass():
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-qq",))
+        record = run_tests(
+            test_pass, spec=spec, name="test_more_quiet_reporting", capture_output=True
+        )
+        s = record.output
         assert "test session starts" not in s
-        assert p1.name not in s
+        assert "test_more_quiet_reporting.py" not in s
         assert "===" not in s
         assert "passed" not in s
 
     @pytest.mark.parametrize(
         "params", [(), ("--collect-only",)], ids=["no-params", "collect-only"]
     )
-    def test_report_collectionfinish_hook(self, pytester: Pytester, params) -> None:
-        pytester.makeconftest(
-            """
-            def pytest_report_collectionfinish(config, start_path, items):
-                return [f'hello from hook: {len(items)} items']
-        """
-        )
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.mark.parametrize('i', range(3))
-            def test(i):
-                pass
-        """
-        )
-        result = pytester.runpytest(*params)
-        result.stdout.fnmatch_lines(["collected 3 items", "hello from hook: 3 items"])
+    def test_report_collectionfinish_hook(self, tmp_path: Path, params) -> None:
+        class CollectionFinishPlugin:
+            def pytest_report_collectionfinish(self, config, start_path, items):
+                return [f"hello from hook: {len(items)} items"]
 
-    def test_summary_f_alias(self, pytester: Pytester) -> None:
+        @pytest.mark.parametrize("i", range(3))
+        def test(i):
+            pass
+
+        spec = ConfigSpec(
+            rootpath=tmp_path,
+            args=params,
+            extra_plugins=(CollectionFinishPlugin(),),
+        )
+        record = run_tests(test, spec=spec, capture_output=True)
+        record.stdout.fnmatch_lines(["collected 3 items", "hello from hook: 3 items"])
+
+    def test_summary_f_alias(self, tmp_path: Path) -> None:
         """Test that 'f' and 'F' report chars are aliases and don't show up twice in the summary (#6334)"""
-        pytester.makepyfile(
-            """
-            def test():
-                assert False
-            """
-        )
-        result = pytester.runpytest("-rfF")
-        expected = "FAILED test_summary_f_alias.py::test - assert False"
-        result.stdout.fnmatch_lines([expected])
-        assert result.stdout.lines.count(expected) == 1
 
+        def test():
+            assert False
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-rfF",))
+        record = run_tests(
+            test, spec=spec, name="test_summary_f_alias", capture_output=True
+        )
+        expected = "FAILED test_summary_f_alias.py::test - assert False"
+        record.stdout.fnmatch_lines([expected])
+        assert record.output.splitlines().count(expected) == 1
+
+    # ensemble: the folded skip line is `<file>:<lineno>`, and an ensemble
+    # item's file:line is the host `test_terminal.py`.
     def test_summary_s_alias(self, pytester: Pytester) -> None:
         """Test that 's' and 'S' report chars are aliases and don't show up twice in the summary"""
         pytester.makepyfile(
@@ -1199,6 +1352,7 @@ class TestTerminalFunctional:
         result.stdout.fnmatch_lines([expected])
         assert result.stdout.lines.count(expected) == 1
 
+    # ensemble: the folded skip line is `<file>:<lineno>`, host-anchored.
     def test_summary_s_folded(self, pytester: Pytester) -> None:
         """Test that skipped tests are correctly folded"""
         pytester.makepyfile(
@@ -1216,26 +1370,26 @@ class TestTerminalFunctional:
         result.stdout.fnmatch_lines([expected])
         assert result.stdout.lines.count(expected) == 1
 
-    def test_summary_s_unfolded(self, pytester: Pytester) -> None:
+    def test_summary_s_unfolded(self, tmp_path: Path) -> None:
         """Test that skipped tests are not folded if --no-fold-skipped is set"""
-        pytester.makepyfile(
-            """
-            import pytest
 
-            @pytest.mark.parametrize("param", [True, False])
-            @pytest.mark.skip("Some reason")
-            def test(param):
-                pass
-            """
+        @pytest.mark.parametrize("param", [True, False])
+        @pytest.mark.skip("Some reason")
+        def test(param):
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, args=("-rs", "--no-fold-skipped"))
+        record = run_tests(
+            test, spec=spec, name="test_summary_s_unfolded", capture_output=True
         )
-        result = pytester.runpytest("-rs", "--no-fold-skipped")
         expected = [
             "SKIPPED test_summary_s_unfolded.py::test[True] - Skipped: Some reason",
             "SKIPPED test_summary_s_unfolded.py::test[False] - Skipped: Some reason",
         ]
-        result.stdout.fnmatch_lines(expected)
-        assert result.stdout.lines.count(expected[0]) == 1
-        assert result.stdout.lines.count(expected[1]) == 1
+        record.stdout.fnmatch_lines(expected)
+        lines = record.output.splitlines()
+        assert lines.count(expected[0]) == 1
+        assert lines.count(expected[1]) == 1
 
 
 @pytest.mark.parametrize(
@@ -1247,18 +1401,31 @@ class TestTerminalFunctional:
     ids=("on CI", "not on CI"),
 )
 def test_fail_extra_reporting(
-    pytester: Pytester, monkeypatch, use_ci: bool, expected_message: str
+    tmp_path: Path, monkeypatch, use_ci: bool, expected_message: str
 ) -> None:
     if use_ci:
         monkeypatch.setenv("CI", "true")
     else:
         monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("COLUMNS", "80")
-    pytester.makepyfile("def test_this(): assert 0, 'this_failed' * 100")
-    result = pytester.runpytest("-rN")
-    result.stdout.no_fnmatch_line("*short test summary*")
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+
+    def test_this():
+        assert 0, "this_failed" * 100
+
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rN",)),
+        name="test_fail_extra_reporting",
+        capture_output=True,
+    )
+    record.stdout.no_fnmatch_line("*short test summary*")
+    record = run_tests(
+        test_this,
+        rootpath=tmp_path,
+        name="test_fail_extra_reporting",
+        capture_output=True,
+    )
+    record.stdout.fnmatch_lines(
         [
             "*test summary*",
             f"FAILED test_fail_extra_reporting.py::test_this {expected_message}",
@@ -1266,26 +1433,51 @@ def test_fail_extra_reporting(
     )
 
 
-def test_fail_reporting_on_pass(pytester: Pytester) -> None:
-    pytester.makepyfile("def test_this(): assert 1")
-    result = pytester.runpytest("-rf")
-    result.stdout.no_fnmatch_line("*short test summary*")
+def test_fail_reporting_on_pass(tmp_path: Path) -> None:
+    def test_this():
+        assert 1
+
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rf",)),
+        capture_output=True,
+    )
+    record.stdout.no_fnmatch_line("*short test summary*")
 
 
-def test_pass_extra_reporting(pytester: Pytester) -> None:
-    pytester.makepyfile("def test_this(): assert 1")
-    result = pytester.runpytest()
-    result.stdout.no_fnmatch_line("*short test summary*")
-    result = pytester.runpytest("-rp")
-    result.stdout.fnmatch_lines(["*test summary*", "PASS*test_pass_extra_reporting*"])
+def test_pass_extra_reporting(tmp_path: Path) -> None:
+    def test_this():
+        assert 1
+
+    record = run_tests(
+        test_this,
+        rootpath=tmp_path,
+        name="test_pass_extra_reporting",
+        capture_output=True,
+    )
+    record.stdout.no_fnmatch_line("*short test summary*")
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rp",)),
+        name="test_pass_extra_reporting",
+        capture_output=True,
+    )
+    record.stdout.fnmatch_lines(["*test summary*", "PASS*test_pass_extra_reporting*"])
 
 
-def test_pass_reporting_on_fail(pytester: Pytester) -> None:
-    pytester.makepyfile("def test_this(): assert 0")
-    result = pytester.runpytest("-rp")
-    result.stdout.no_fnmatch_line("*short test summary*")
+def test_pass_reporting_on_fail(tmp_path: Path) -> None:
+    def test_this():
+        assert 0
+
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rp",)),
+        capture_output=True,
+    )
+    record.stdout.no_fnmatch_line("*short test summary*")
 
 
+# ensemble: asserts on `Captured stdout` sections, which need capture.
 def test_pass_output_reporting(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -1326,6 +1518,9 @@ def test_pass_output_reporting(pytester: Pytester) -> None:
     )
 
 
+# ensemble: asserts the ` [100%]` progress column (only written from
+# `pytest_runtestloop`, which an ensemble does not run) and the
+# `test_color_yes.py:5:` crash lines, which are host-anchored.
 def test_color_yes(pytester: Pytester, color_mapping) -> None:
     p1 = pytester.makepyfile(
         """
@@ -1385,34 +1580,41 @@ def test_color_yes(pytester: Pytester, color_mapping) -> None:
     )
 
 
-def test_color_no(pytester: Pytester) -> None:
-    pytester.makepyfile("def test_this(): assert 1")
-    result = pytester.runpytest("--color=no")
-    assert "test session starts" in result.stdout.str()
-    result.stdout.no_fnmatch_line("*\x1b[1m*")
+def test_color_no(tmp_path: Path) -> None:
+    def test_this():
+        assert 1
+
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=("--color=no",)),
+        capture_output=True,
+    )
+    assert "test session starts" in record.output
+    record.stdout.no_fnmatch_line("*\x1b[1m*")
 
 
 @pytest.mark.parametrize("verbose", [True, False])
-def test_color_yes_collection_on_non_atty(pytester: Pytester, verbose) -> None:
+def test_color_yes_collection_on_non_atty(tmp_path: Path, verbose) -> None:
     """#1397: Skip collect progress report when working on non-terminals."""
-    pytester.makepyfile(
-        """
-        import pytest
-        @pytest.mark.parametrize('i', range(10))
-        def test_this(i):
-            assert 1
-    """
-    )
+
+    @pytest.mark.parametrize("i", range(10))
+    def test_this(i):
+        assert 1
+
     args = ["--color=yes"]
     if verbose:
         args.append("-vv")
-    result = pytester.runpytest(*args)
-    assert "test session starts" in result.stdout.str()
-    assert "\x1b[1m" in result.stdout.str()
-    result.stdout.no_fnmatch_line("*collecting 10 items*")
+    record = run_tests(
+        test_this,
+        spec=ConfigSpec(rootpath=tmp_path, args=tuple(args)),
+        capture_output=True,
+    )
+    assert "test session starts" in record.output
+    assert "\x1b[1m" in record.output
+    record.stdout.no_fnmatch_line("*collecting 10 items*")
     if verbose:
-        assert "collecting ..." in result.stdout.str()
-    assert "collected 10 items" in result.stdout.str()
+        assert "collecting ..." in record.output
+    assert "collected 10 items" in record.output
 
 
 def test_getreportopt() -> None:
@@ -1474,25 +1676,27 @@ def test_getreportopt() -> None:
     assert getreportopt(config) == "fE"
 
 
-def test_terminalreporter_reportopt_addopts(pytester: Pytester) -> None:
-    pytester.makeini("[pytest]\naddopts=-rs")
-    pytester.makepyfile(
-        """
-        import pytest
+def test_terminalreporter_reportopt_addopts(tmp_path: Path) -> None:
+    @pytest.fixture
+    def tr(request):
+        tr = request.config.pluginmanager.getplugin("terminalreporter")
+        return tr
 
-        @pytest.fixture
-        def tr(request):
-            tr = request.config.pluginmanager.getplugin("terminalreporter")
-            return tr
-        def test_opt(tr):
-            assert tr.hasopt('skipped')
-            assert not tr.hasopt('qwe')
-    """
+    def test_opt(tr):
+        assert tr.hasopt("skipped")
+        assert not tr.hasopt("qwe")
+
+    spec = ConfigSpec(rootpath=tmp_path, inicfg={"addopts": "-rs"})
+    record = run_tests(
+        build_module("test_reportopt_addopts", tr=tr, test_opt=test_opt),
+        spec=spec,
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["*1 passed*"])
+    record.stdout.fnmatch_lines(["*1 passed*"])
+    record.assert_outcomes(passed=1)
 
 
+# ensemble: asserts `*<file>:8*`; an ensemble item's file:line is host-anchored.
 def test_tbstyle_short(pytester: Pytester) -> None:
     p = pytester.makepyfile(
         """
@@ -1517,6 +1721,8 @@ def test_tbstyle_short(pytester: Pytester) -> None:
     assert "assert x" in s
 
 
+# ensemble: asserts the NO_TESTS_COLLECTED exit code, which comes from
+# `wrap_session`.
 def test_traceconfig(pytester: Pytester) -> None:
     result = pytester.runpytest("--traceconfig")
     result.stdout.fnmatch_lines(["*active plugins*"])
@@ -1527,6 +1733,8 @@ class TestGenericReporting:
     """Test class which can be subclassed with a different option provider to
     run e.g. distributed tests."""
 
+    # ensemble: needs a module that raises ImportError at import time;
+    # ensemble sources are already-imported objects.
     def test_collect_fail(self, pytester: Pytester, option) -> None:
         pytester.makepyfile("import xyz\n")
         result = pytester.runpytest(*option.args)
@@ -1534,6 +1742,8 @@ class TestGenericReporting:
             ["ImportError while importing*", "*No module named *xyz*", "*1 error*"]
         )
 
+    # ensemble: `! stopping after N failures !` is emitted from the run loop
+    # in `_pytest.main`, which an ensemble bypasses.
     def test_maxfailures(self, pytester: Pytester, option) -> None:
         pytester.makepyfile(
             """
@@ -1555,6 +1765,7 @@ class TestGenericReporting:
             ]
         )
 
+    # ensemble: `! session_interrupted !` is emitted from the run loop.
     def test_maxfailures_with_interrupted(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             """
@@ -1574,25 +1785,23 @@ class TestGenericReporting:
             ]
         )
 
-    def test_tb_option(self, pytester: Pytester, option) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def g():
-                raise IndexError
-            def test_func():
-                print(6*7)
-                g()  # --calling--
-        """
-        )
+    def test_tb_option(self, tmp_path: Path, option) -> None:
+        def g():
+            raise IndexError
+
+        def test_func():
+            print(6 * 7)
+            g()  # --calling--
+
+        module = build_module("test_tb_option", g=g, test_func=test_func)
         for tbopt in ["long", "short", "no"]:
             print(f"testing --tb={tbopt}...")
-            result = pytester.runpytest("-rN", f"--tb={tbopt}")
-            s = result.stdout.str()
+            spec = ConfigSpec(rootpath=tmp_path, args=("-rN", f"--tb={tbopt}"))
+            s = run_tests(module, spec=spec, capture_output=True).output
             if tbopt == "long":
-                assert "print(6*7)" in s
+                assert "print(6 * 7)" in s
             else:
-                assert "print(6*7)" not in s
+                assert "print(6 * 7)" not in s
             if tbopt != "no":
                 assert "--calling--" in s
                 assert "IndexError" in s
@@ -1601,6 +1810,7 @@ class TestGenericReporting:
                 assert "--calling--" not in s
                 assert "IndexError" not in s
 
+    # ensemble: asserts a `Captured stdout call` section, which needs capture.
     def test_tb_line_show_capture(self, pytester: Pytester, option) -> None:
         output_to_capture = "help! let me out!"
         pytester.makepyfile(
@@ -1614,6 +1824,7 @@ class TestGenericReporting:
         result = pytester.runpytest("--tb=line")
         result.stdout.fnmatch_lines(["*- Captured stdout call -*", output_to_capture])
 
+    # ensemble: asserts `<file>:<lineno>` crash lines, host-anchored.
     def test_tb_crashline(self, pytester: Pytester, option) -> None:
         p = pytester.makepyfile(
             """
@@ -1635,6 +1846,7 @@ class TestGenericReporting:
         s = result.stdout.str()
         assert "def test_func2" not in s
 
+    # ensemble: asserts a `<file>:<lineno>` crash line, host-anchored.
     def test_tb_crashline_pytrace_false(self, pytester: Pytester, option) -> None:
         p = pytester.makepyfile(
             """
@@ -1648,6 +1860,8 @@ class TestGenericReporting:
         bn = p.name
         result.stdout.fnmatch_lines([f"*{bn}:3: Failed: test_func1"])
 
+    # ensemble: the point is that a subdirectory conftest contributes header
+    # lines; ensembles have no directory tree to scope conftests to.
     def test_pytest_report_header(self, pytester: Pytester, option) -> None:
         pytester.makeconftest(
             """
@@ -1667,6 +1881,7 @@ def pytest_report_header(config, start_path):
         result = pytester.runpytest("a")
         result.stdout.fnmatch_lines(["*hello: 42*", "line1", str(pytester.path)])
 
+    # ensemble: `--show-capture` is entirely about captured output sections.
     def test_show_capture(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             """
@@ -1718,6 +1933,7 @@ def pytest_report_header(config, start_path):
         assert "!This is stderr!" not in stdout
         assert "!This is a warning log msg!" not in stdout
 
+    # ensemble: `--show-capture` is entirely about captured output sections.
     def test_show_capture_with_teardown_logs(self, pytester: Pytester) -> None:
         """Ensure that the capturing of teardown logs honor --show-capture setting"""
         pytester.makepyfile(
@@ -1759,6 +1975,7 @@ def pytest_report_header(config, start_path):
         assert "!log!" not in result
 
 
+# ensemble: uses the `capfd` fixture, which needs capture.
 @pytest.mark.xfail("not hasattr(os, 'dup')")
 def test_fdopen_kept_alive_issue124(pytester: Pytester) -> None:
     pytester.makepyfile(
@@ -1778,6 +1995,8 @@ def test_fdopen_kept_alive_issue124(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["*2 passed*"])
 
 
+# ensemble: asserts the file name in a native traceback frame, which for an
+# ensemble source is the host `test_terminal.py`.
 def test_tbstyle_native_setup_error(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -1796,6 +2015,8 @@ def test_tbstyle_native_setup_error(pytester: Pytester) -> None:
     )
 
 
+# ensemble: asserts `exitstatus: 5` (NO_TESTS_COLLECTED); the exit status an
+# ensemble hands to `pytest_sessionfinish` is not computed by `wrap_session`.
 def test_terminal_summary(pytester: Pytester) -> None:
     pytester.makeconftest(
         """
@@ -1816,6 +2037,8 @@ def test_terminal_summary(pytester: Pytester) -> None:
     )
 
 
+# ensemble: asserts `*conftest.py:3:*internal warning`, i.e. the file and line
+# of the warning's origin, which for an ensemble plugin object is the host file.
 @pytest.mark.filterwarnings("default::UserWarning")
 def test_terminal_summary_warnings_are_displayed(pytester: Pytester) -> None:
     """Test that warnings emitted during pytest_terminal_summary are displayed.
@@ -1853,18 +2076,27 @@ def test_terminal_summary_warnings_are_displayed(pytester: Pytester) -> None:
     assert stdout.count("=== warnings summary ") == 2
 
 
-@pytest.mark.filterwarnings("default::UserWarning")
-def test_terminal_summary_warnings_header_once(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_failure():
-            import warnings
-            warnings.warn("warning_from_" + "test")
-            assert 0
-    """
+def test_terminal_summary_warnings_header_once(tmp_path: Path) -> None:
+    def test_failure():
+        import warnings
+
+        warnings.warn("warning_from_" + "test")
+        assert 0
+
+    # The host suite runs with `filterwarnings = error`; the ensemble needs
+    # the warning to be shown rather than raised.
+    spec = ConfigSpec(
+        rootpath=tmp_path,
+        args=("-ra",),
+        inicfg={"filterwarnings": ["default::UserWarning"]},
     )
-    result = pytester.runpytest("-ra")
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        test_failure,
+        spec=spec,
+        name="test_terminal_summary_warnings_header_once",
+        capture_output=True,
+    )
+    record.stdout.fnmatch_lines(
         [
             "*= warnings summary =*",
             "*warning_from_test*",
@@ -1872,25 +2104,32 @@ def test_terminal_summary_warnings_header_once(pytester: Pytester) -> None:
             "*== 1 failed, 1 warning in *",
         ]
     )
-    result.stdout.no_fnmatch_line("*None*")
-    stdout = result.stdout.str()
+    record.stdout.no_fnmatch_line("*None*")
+    stdout = record.output
     assert stdout.count("warning_from_test") == 1
     assert stdout.count("=== warnings summary ") == 1
 
 
-@pytest.mark.filterwarnings("default")
-def test_terminal_no_summary_warnings_header_once(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_failure():
-            import warnings
-            warnings.warn("warning_from_" + "test")
-            assert 0
-    """
+def test_terminal_no_summary_warnings_header_once(tmp_path: Path) -> None:
+    def test_failure():
+        import warnings
+
+        warnings.warn("warning_from_" + "test")
+        assert 0
+
+    spec = ConfigSpec(
+        rootpath=tmp_path,
+        args=("--no-summary",),
+        inicfg={"filterwarnings": ["default"]},
     )
-    result = pytester.runpytest("--no-summary")
-    result.stdout.no_fnmatch_line("*= warnings summary =*")
-    result.stdout.no_fnmatch_line("*= short test summary info =*")
+    record = run_tests(
+        test_failure,
+        spec=spec,
+        name="test_terminal_no_summary_warnings_header_once",
+        capture_output=True,
+    )
+    record.stdout.no_fnmatch_line("*= warnings summary =*")
+    record.stdout.no_fnmatch_line("*= short test summary info =*")
 
 
 @pytest.fixture(scope="session")
@@ -2077,22 +2316,44 @@ class TestClassicOutputStyle:
     """Ensure classic output style works as expected (#3883)"""
 
     @pytest.fixture
-    def test_files(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            **{
-                "test_one.py": "def test_one(): pass",
-                "test_two.py": "def test_two(): assert 0",
-                "sub/test_three.py": """
-                    def test_three_1(): pass
-                    def test_three_2(): assert 0
-                    def test_three_3(): pass
-                """,
-            }
+    def test_files(self) -> tuple[object, ...]:
+        def test_one():
+            pass
+
+        def test_two():
+            assert 0
+
+        def test_three_1():
+            pass
+
+        def test_three_2():
+            assert 0
+
+        def test_three_3():
+            pass
+
+        # Collected in the order a filesystem walk would produce them.
+        return (
+            build_module(
+                "sub/test_three",
+                test_three_1=test_three_1,
+                test_three_2=test_three_2,
+                test_three_3=test_three_3,
+            ),
+            build_module("test_one", test_one=test_one),
+            build_module("test_two", test_two=test_two),
         )
 
-    def test_normal_verbosity(self, pytester: Pytester, test_files) -> None:
-        result = pytester.runpytest("-o", "console_output_style=classic")
-        result.stdout.fnmatch_lines(
+    @staticmethod
+    def _run(tmp_path: Path, test_files, *args: str):
+        spec = ConfigSpec(
+            rootpath=tmp_path, args=("-o", "console_output_style=classic", *args)
+        )
+        return run_tests(*test_files, spec=spec, capture_output=True)
+
+    def test_normal_verbosity(self, tmp_path: Path, test_files) -> None:
+        record = self._run(tmp_path, test_files)
+        record.stdout.fnmatch_lines(
             [
                 f"sub{os.sep}test_three.py .F.",
                 "test_one.py .",
@@ -2100,10 +2361,11 @@ class TestClassicOutputStyle:
                 "*2 failed, 3 passed in*",
             ]
         )
+        record.assert_outcomes(passed=3, failed=2)
 
-    def test_verbose(self, pytester: Pytester, test_files) -> None:
-        result = pytester.runpytest("-o", "console_output_style=classic", "-v")
-        result.stdout.fnmatch_lines(
+    def test_verbose(self, tmp_path: Path, test_files) -> None:
+        record = self._run(tmp_path, test_files, "-v")
+        record.stdout.fnmatch_lines(
             [
                 f"sub{os.sep}test_three.py::test_three_1 PASSED",
                 f"sub{os.sep}test_three.py::test_three_2 FAILED",
@@ -2113,12 +2375,15 @@ class TestClassicOutputStyle:
                 "*2 failed, 3 passed in*",
             ]
         )
+        record.assert_outcomes(passed=3, failed=2)
 
-    def test_quiet(self, pytester: Pytester, test_files) -> None:
-        result = pytester.runpytest("-o", "console_output_style=classic", "-q")
-        result.stdout.fnmatch_lines([".F..F", "*2 failed, 3 passed in*"])
+    def test_quiet(self, tmp_path: Path, test_files) -> None:
+        record = self._run(tmp_path, test_files, "-q")
+        record.stdout.fnmatch_lines([".F..F", "*2 failed, 3 passed in*"])
+        record.assert_outcomes(passed=3, failed=2)
 
 
+# ensemble: asserts a usage error written to stderr by the command line parser.
 def test_console_output_style_invalid(pytester: Pytester) -> None:
     """An invalid console_output_style fails with a clean usage error."""
     result = pytester.runpytest("-o", "console_output_style=fancy")
@@ -2132,6 +2397,12 @@ def test_console_output_style_invalid(pytester: Pytester) -> None:
     )
 
 
+# ensemble: every test below asserts on the progress column (` [ 50%]`,
+# ` [10/20]`, a duration). The reporter only shows it when capturing is
+# active - process-global state an ensemble does not install - and the
+# final `[100%]` is written from a `pytest_runtestloop` wrapper, which an
+# ensemble never runs. `test_zero_tests_collected` is left for the same
+# reason: with the progress column off, the division it guards never happens.
 class TestProgressOutputStyle:
     @pytest.fixture
     def many_tests_files(self, pytester: Pytester) -> None:
@@ -2452,6 +2723,8 @@ class TestProgressOutputStyle:
         )
 
 
+# ensemble: every test below asserts on the progress column; see
+# TestProgressOutputStyle.
 class TestProgressWithTeardown:
     """Ensure we show the correct percentages for tests that fail during teardown (#3088)"""
 
@@ -2660,6 +2933,10 @@ def test_line_with_reprcrash(monkeypatch: MonkeyPatch) -> None:
     check("🉐🉐🉐🉐🉐\n2nd line", 80, "FAILED nodeid::🉐::withunicode - 🉐🉐🉐🉐🉐")
 
 
+# ensemble: the assertion explanation is produced by the *host* assertion
+# plugin (sources in this file are rewritten by the host, and
+# `_pytest.assertion.util` keeps its verbosity in a module global bound at
+# host configure time), so `-vv` inside an ensemble does not un-truncate it.
 def test_short_summary_with_verbose(
     monkeypatch: MonkeyPatch, pytester: Pytester
 ) -> None:
@@ -2697,6 +2974,8 @@ def test_short_summary_with_verbose(
     )
 
 
+# ensemble: assertion verbosity is host-global; see
+# test_short_summary_with_verbose.
 def test_full_sequence_print_with_vv(
     monkeypatch: MonkeyPatch, pytester: Pytester
 ) -> None:
@@ -2726,6 +3005,8 @@ def test_full_sequence_print_with_vv(
     )
 
 
+# ensemble: assertion verbosity is host-global; see
+# test_short_summary_with_verbose.
 def test_force_short_summary(monkeypatch: MonkeyPatch, pytester: Pytester) -> None:
     monkeypatch.setattr(_pytest.terminal, "running_on_ci", lambda: False)
 
@@ -2781,6 +3062,8 @@ def test_format_node_duration(seconds: float, expected: str) -> None:
     assert format_node_duration(seconds) == expected
 
 
+# ensemble: asserts `! Interrupted: 1 error during collection !`, produced by
+# `wrap_session`, and needs a module that fails at import.
 def test_collecterror(pytester: Pytester) -> None:
     p1 = pytester.makepyfile("raise SyntaxError()")
     result = pytester.runpytest("-ra", str(p1))
@@ -2798,12 +3081,15 @@ def test_collecterror(pytester: Pytester) -> None:
     )
 
 
+# ensemble: needs a module that fails at import.
 def test_no_summary_collecterror(pytester: Pytester) -> None:
     p1 = pytester.makepyfile("raise SyntaxError()")
     result = pytester.runpytest("-ra", "--no-summary", str(p1))
     result.stdout.no_fnmatch_line("*= ERRORS =*")
 
 
+# ensemble: asserts the `<- <string>` suffix at -vv; ensemble items always
+# carry a `<- .../test_terminal.py` suffix instead.
 def test_via_exec(pytester: Pytester) -> None:
     p1 = pytester.makepyfile("exec('def test_via_exec(): pass')")
     result = pytester.runpytest(str(p1), "-vv")
@@ -2813,6 +3099,11 @@ def test_via_exec(pytester: Pytester) -> None:
 
 
 class TestCodeHighlight:
+    # ensemble: the rendering asserted here is of the source line
+    # `assert 1 == 10`, character for character. As real code in this file that
+    # line needs a `# type: ignore[comparison-overlap]` (the suite runs mypy
+    # with strict_equality), and the trailing comment becomes part of the
+    # highlighted line - so the port would have to weaken the pattern.
     def test_code_highlight_simple(self, pytester: Pytester, color_mapping) -> None:
         pytester.makepyfile(
             """
@@ -2831,6 +3122,9 @@ class TestCodeHighlight:
             )
         )
 
+    # ensemble: the source under test is a `print('''...'''); assert 0`
+    # one-liner whose exact layout is the point; as real code in this file the
+    # formatter would rewrite it and the expected highlighting with it.
     def test_code_highlight_continuation(
         self, pytester: Pytester, color_mapping
     ) -> None:
@@ -2854,6 +3148,7 @@ class TestCodeHighlight:
             )
         )
 
+    # ensemble: see test_code_highlight_simple.
     def test_code_highlight_custom_theme(
         self, pytester: Pytester, color_mapping, monkeypatch: MonkeyPatch
     ) -> None:
@@ -2876,6 +3171,7 @@ class TestCodeHighlight:
             )
         )
 
+    # ensemble: asserts a startup error written to stderr by a subprocess.
     def test_code_highlight_invalid_theme(
         self, pytester: Pytester, color_mapping, monkeypatch: MonkeyPatch
     ) -> None:
@@ -2892,6 +3188,7 @@ class TestCodeHighlight:
             "Hint: See available pygments styles with `pygmentize -L styles`."
         )
 
+    # ensemble: asserts a startup error written to stderr by a subprocess.
     def test_code_highlight_invalid_theme_mode(
         self, pytester: Pytester, color_mapping, monkeypatch: MonkeyPatch
     ) -> None:
@@ -2933,6 +3230,8 @@ def test_format_trimmed() -> None:
     assert _format_trimmed(" ({}) ", msg, len(msg) + 3) == " (unconditional ...) "
 
 
+# ensemble: asserts a `configfile:` header line; ensemble configs never read
+# a config file.
 def test_warning_when_init_trumps_pyproject_toml(
     pytester: Pytester, monkeypatch: MonkeyPatch
 ) -> None:
@@ -2954,6 +3253,7 @@ def test_warning_when_init_trumps_pyproject_toml(
     )
 
 
+# ensemble: asserts a `configfile:` header line.
 def test_warning_when_init_trumps_multiple_files(
     pytester: Pytester, monkeypatch: MonkeyPatch
 ) -> None:
@@ -2986,6 +3286,7 @@ def test_warning_when_init_trumps_multiple_files(
     )
 
 
+# ensemble: asserts a `configfile:` header line.
 def test_no_warning_when_init_but_pyproject_toml_has_no_entry(
     pytester: Pytester, monkeypatch: MonkeyPatch
 ) -> None:
@@ -3007,6 +3308,7 @@ def test_no_warning_when_init_but_pyproject_toml_has_no_entry(
     )
 
 
+# ensemble: asserts a `configfile:` header line.
 def test_no_warning_on_terminal_with_a_single_config_file(
     pytester: Pytester, monkeypatch: MonkeyPatch
 ) -> None:
@@ -3027,6 +3329,10 @@ def test_no_warning_on_terminal_with_a_single_config_file(
     )
 
 
+# ensemble: every test below matches whole blocks of consecutive lines whose
+# exact column layout is the point - the trailing ` [100%]` progress column
+# (never rendered by an ensemble, see TestProgressOutputStyle) is part of that
+# layout, and half of them assert on `--collect-only` rendering.
 class TestFineGrainedTestCase:
     DEFAULT_FILE_CONTENTS = """
             import pytest
@@ -3260,26 +3566,42 @@ class TestFineGrainedTestCase:
         return p
 
 
-def test_summary_xfail_reason(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+def test_summary_xfail_reason(tmp_path: Path) -> None:
+    @pytest.mark.xfail
+    def test_xfail():
+        assert False
 
-        @pytest.mark.xfail
-        def test_xfail():
-            assert False
+    @pytest.mark.xfail(reason="foo")
+    def test_xfail_reason():
+        assert False
 
-        @pytest.mark.xfail(reason="foo")
-        def test_xfail_reason():
-            assert False
-        """
+    record = run_tests(
+        test_xfail,
+        test_xfail_reason,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rx",)),
+        name="test_summary_xfail_reason",
+        capture_output=True,
     )
-    result = pytester.runpytest("-rx")
     expect1 = "XFAIL test_summary_xfail_reason.py::test_xfail"
     expect2 = "XFAIL test_summary_xfail_reason.py::test_xfail_reason - foo"
-    result.stdout.fnmatch_lines([expect1, expect2])
-    assert result.stdout.lines.count(expect1) == 1
-    assert result.stdout.lines.count(expect2) == 1
+    record.stdout.fnmatch_lines([expect1, expect2])
+    lines = record.output.splitlines()
+    assert lines.count(expect1) == 1
+    assert lines.count(expect2) == 1
+
+
+@pytest.fixture()
+def xfail_testsources() -> tuple[object, ...]:
+    def test_fail():
+        a, b = 1, 2
+        assert a == b
+
+    @pytest.mark.xfail
+    def test_xfail():
+        c, d = 3, 4
+        assert c == d
+
+    return (test_fail, test_xfail)
 
 
 @pytest.fixture()
@@ -3300,11 +3622,13 @@ def xfail_testfile(pytester: Pytester) -> Path:
     )
 
 
-def test_xfail_tb_default(xfail_testfile, pytester: Pytester) -> None:
-    result = pytester.runpytest(xfail_testfile)
+def test_xfail_tb_default(xfail_testsources, tmp_path: Path) -> None:
+    record = run_tests(
+        *xfail_testsources, rootpath=tmp_path, name="test_xfail_tb", capture_output=True
+    )
 
     # test_fail, show traceback
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*= FAILURES =*",
             "*_ test_fail _*",
@@ -3316,14 +3640,20 @@ def test_xfail_tb_default(xfail_testfile, pytester: Pytester) -> None:
     )
 
     # test_xfail, don't show traceback
-    result.stdout.no_fnmatch_line("*= XFAILURES =*")
+    record.stdout.no_fnmatch_line("*= XFAILURES =*")
+    record.assert_outcomes(failed=1, xfailed=1)
 
 
-def test_xfail_tb_true(xfail_testfile, pytester: Pytester) -> None:
-    result = pytester.runpytest(xfail_testfile, "--xfail-tb")
+def test_xfail_tb_true(xfail_testsources, tmp_path: Path) -> None:
+    record = run_tests(
+        *xfail_testsources,
+        spec=ConfigSpec(rootpath=tmp_path, args=("--xfail-tb",)),
+        name="test_xfail_tb",
+        capture_output=True,
+    )
 
     # both test_fail and test_xfail, show traceback
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*= FAILURES =*",
             "*_ test_fail _*",
@@ -3340,8 +3670,11 @@ def test_xfail_tb_true(xfail_testfile, pytester: Pytester) -> None:
             "*short test summary info*",
         ]
     )
+    record.assert_outcomes(failed=1, xfailed=1)
 
 
+# ensemble: `--tb=line` renders `<file>:<lineno>: <message>`, and an ensemble
+# item's file:line is the host `test_terminal.py`.
 def test_xfail_tb_line(xfail_testfile, pytester: Pytester) -> None:
     result = pytester.runpytest(xfail_testfile, "--xfail-tb", "--tb=line")
 
@@ -3357,28 +3690,29 @@ def test_xfail_tb_line(xfail_testfile, pytester: Pytester) -> None:
     )
 
 
-def test_summary_xpass_reason(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+def test_summary_xpass_reason(tmp_path: Path) -> None:
+    @pytest.mark.xfail
+    def test_pass(): ...
 
-        @pytest.mark.xfail
-        def test_pass():
-            ...
+    @pytest.mark.xfail(reason="foo")
+    def test_reason(): ...
 
-        @pytest.mark.xfail(reason="foo")
-        def test_reason():
-            ...
-        """
+    record = run_tests(
+        test_pass,
+        test_reason,
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rX",)),
+        name="test_summary_xpass_reason",
+        capture_output=True,
     )
-    result = pytester.runpytest("-rX")
     expect1 = "XPASS test_summary_xpass_reason.py::test_pass"
     expect2 = "XPASS test_summary_xpass_reason.py::test_reason - foo"
-    result.stdout.fnmatch_lines([expect1, expect2])
-    assert result.stdout.lines.count(expect1) == 1
-    assert result.stdout.lines.count(expect2) == 1
+    record.stdout.fnmatch_lines([expect1, expect2])
+    lines = record.output.splitlines()
+    assert lines.count(expect1) == 1
+    assert lines.count(expect2) == 1
 
 
+# ensemble: asserts a `Captured stdout call` section, which needs capture.
 def test_xpass_output(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -3403,6 +3737,8 @@ def test_xpass_output(pytester: Pytester) -> None:
 
 
 class TestNodeIDHandling:
+    # ensemble: the point is how nodeids are rendered relative to a rootdir
+    # that differs from the invocation dir, which needs a real directory tree.
     def test_nodeid_handling_windows_paths(self, pytester: Pytester, tmp_path) -> None:
         """Test the correct handling of Windows-style paths with backslashes."""
         pytester.makeini("[pytest]")  # Change `config.rootpath`
@@ -3455,6 +3791,9 @@ class TestTerminalProgressPlugin:
         tr._progress_nodeids_reported = set()
         return tr
 
+    # ensemble: the plugin decides whether to register from the terminal
+    # reporter's file being a tty; an ensemble's file is a private buffer, so
+    # monkeypatching `sys.stdout.isatty` would not reach it.
     @pytest.mark.skipif(sys.platform != "win32", reason="#13896")
     def test_plugin_registration_enabled_by_default(
         self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
@@ -3469,6 +3808,7 @@ class TestTerminalProgressPlugin:
         plugin = config.pluginmanager.get_plugin("terminalprogress")
         assert plugin is not None
 
+    # ensemble: see test_plugin_registration_enabled_by_default.
     def test_plugin_registred_on_all_platforms_when_explicitly_requested(
         self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
     ) -> None:
@@ -3479,6 +3819,7 @@ class TestTerminalProgressPlugin:
         plugin = config.pluginmanager.get_plugin("terminalprogress")
         assert plugin is not None
 
+    # ensemble: see test_plugin_registration_enabled_by_default.
     def test_disabled_for_non_tty(
         self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
     ) -> None:
@@ -3488,6 +3829,7 @@ class TestTerminalProgressPlugin:
         plugin = config.pluginmanager.get_plugin("terminalprogress-plugin")
         assert plugin is None
 
+    # ensemble: see test_plugin_registration_enabled_by_default.
     def test_disabled_for_dumb_terminal(
         self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
     ) -> None:
