@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from enum import Enum
 import json
+import logging
+from pathlib import Path
 import sys
+import types
 from typing import Literal
+import unittest
 
 from _pytest._io.saferepr import saferepr
+from _pytest.ensemble import build_module
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import run_tests
+from _pytest.ensemble import Source
+from _pytest.outcomes import Exit
+from _pytest.reports import TestReport
 from _pytest.subtests import SubtestContext
 from _pytest.subtests import SubtestReport
 import pytest
@@ -14,24 +24,55 @@ import pytest
 IS_PY311 = sys.version_info[:2] >= (3, 11)
 
 
-def test_failures(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        def test_foo(subtests):
-            with subtests.test("foo subtest"):
-                assert False, "foo subtest failure"
+def _subtests_spec(tmp_path: Path, *args: str, **inicfg: str) -> ConfigSpec:
+    """A :class:`ConfigSpec` for an ensemble exercising subtests.
 
-        def test_bar(subtests):
-            with subtests.test("bar subtest"):
-                assert False, "bar subtest failure"
-            assert False, "test_bar also failed"
-
-        def test_zaz(subtests):
-            with subtests.test("zaz subtest"):
-                pass
-        """
+    ``subtests`` is not one of the ensemble default plugins, so it has to be
+    asked for explicitly.
+    """
+    return ConfigSpec(rootpath=tmp_path, args=args, inicfg=inicfg).with_plugins(
+        "subtests"
     )
+
+
+def _rendering_spec(tmp_path: Path, *args: str, **inicfg: str) -> ConfigSpec:
+    """As :func:`_subtests_spec`, for ensembles whose *output* is the subject.
+
+    Only usable together with ``capture_output=True``, which is what pulls in
+    the terminal plugin these settings belong to. The console output style is
+    bumped because the terminal reporter draws the progress percentages only
+    when it believes output is being captured - which an ensemble's terminal,
+    having no capture manager of its own, never is.
+    """
+    return _subtests_spec(
+        tmp_path,
+        *args,
+        console_output_style="progress-even-when-capture-no",
+        **inicfg,
+    )
+
+
+def _failure_sources() -> types.ModuleType:
+    """The module under test of ``test_failures``."""
+
+    def test_foo(subtests: pytest.Subtests) -> None:
+        with subtests.test("foo subtest"):
+            assert False, "foo subtest failure"
+
+    def test_bar(subtests: pytest.Subtests) -> None:
+        with subtests.test("bar subtest"):
+            assert False, "bar subtest failure"
+        assert False, "test_bar also failed"
+
+    def test_zaz(subtests: pytest.Subtests) -> None:
+        with subtests.test("zaz subtest"):
+            pass
+
+    return build_module("test_failures", test_foo, test_bar, test_zaz)
+
+
+def test_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLUMNS", "120")
     summary_lines = [
         "*=== FAILURES ===*",
         #
@@ -53,17 +94,26 @@ def test_failures(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) ->
         "SUBFAILED[[]bar subtest[]] test_*.py::test_bar - AssertionError*",
         "FAILED test_*.py::test_bar - AssertionError*",
     ]
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        _failure_sources(), spec=_rendering_spec(tmp_path), capture_output=True
+    )
+    record.stdout.fnmatch_lines(
         [
-            "test_*.py uFuF.    *     [[]100%[]]",
+            # The original also matched a trailing "[100%]" here. The terminal
+            # reporter defers that final fill to ``pytest_runtestloop``, which
+            # an ensemble never calls - it drives the items directly. The
+            # per-test letters, which are what this test is about, are intact.
+            "test_*.py uFuF.",
             *summary_lines,
             "* 4 failed, 1 passed in *",
         ]
     )
+    record.assert_outcomes(failed=4, passed=1)
 
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        _failure_sources(), spec=_rendering_spec(tmp_path, "-v"), capture_output=True
+    )
+    record.stdout.fnmatch_lines(
         [
             "test_*.py::test_foo SUBFAILED[[]foo subtest[]]    *     [[] 33%[]]",
             "test_*.py::test_foo FAILED                        *     [[] 33%[]]",
@@ -75,14 +125,16 @@ def test_failures(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) ->
             "* 4 failed, 1 passed, 1 subtests passed in *",
         ]
     )
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_subtests = 0
-        """
+    # "subtests passed" is a terminal category of its own, which
+    # assert_outcomes() (like RunResult.assert_outcomes) does not know about.
+    assert record.outcomes()["subtests passed"] == 1
+
+    record = run_tests(
+        _failure_sources(),
+        spec=_rendering_spec(tmp_path, "-v", verbosity_subtests="0"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "test_*.py::test_foo SUBFAILED[[]foo subtest[]]    *     [[] 33%[]]",
             "test_*.py::test_foo FAILED                        *     [[] 33%[]]",
@@ -93,32 +145,42 @@ def test_failures(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) ->
             "* 4 failed, 1 passed in *",
         ]
     )
-    result.stdout.no_fnmatch_line("test_*.py::test_zaz SUBPASSED[[]zaz subtest[]]*")
+    record.stdout.no_fnmatch_line("test_*.py::test_zaz SUBPASSED[[]zaz subtest[]]*")
+    assert "subtests passed" not in record.outcomes()
 
 
-def test_passes(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
+def _passing_sources() -> types.ModuleType:
+    """The module under test of ``test_passes``."""
+
+    def test_foo(subtests: pytest.Subtests) -> None:
+        with subtests.test("foo subtest"):
+            pass
+
+    def test_bar(subtests: pytest.Subtests) -> None:
+        with subtests.test("bar subtest"):
+            pass
+
+    return build_module("test_passes", test_foo, test_bar)
+
+
+def test_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        def test_foo(subtests):
-            with subtests.test("foo subtest"):
-                pass
-
-        def test_bar(subtests):
-            with subtests.test("bar subtest"):
-                pass
-        """
+    record = run_tests(
+        _passing_sources(), spec=_rendering_spec(tmp_path), capture_output=True
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
-            "test_*.py ..    *     [[]100%[]]",
+            # see test_failures on the dropped "[100%]"
+            "test_*.py ..",
             "* 2 passed in *",
         ]
     )
+    record.assert_outcomes(passed=2)
 
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        _passing_sources(), spec=_rendering_spec(tmp_path, "-v"), capture_output=True
+    )
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo SUBPASSED[[]foo subtest[]]      * [[] 50%[]]",
             "*.py::test_foo PASSED                          * [[] 50%[]]",
@@ -127,52 +189,63 @@ def test_passes(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> N
             "* 2 passed, 2 subtests passed in *",
         ]
     )
+    assert record.outcomes()["subtests passed"] == 2
 
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_subtests = 0
-        """
+    record = run_tests(
+        _passing_sources(),
+        spec=_rendering_spec(tmp_path, "-v", verbosity_subtests="0"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo PASSED                          * [[] 50%[]]",
             "*.py::test_bar PASSED                          * [[]100%[]]",
             "* 2 passed in *",
         ]
     )
-    result.stdout.no_fnmatch_line("*.py::test_foo SUBPASSED[[]foo subtest[]]*")
-    result.stdout.no_fnmatch_line("*.py::test_bar SUBPASSED[[]bar subtest[]]*")
+    record.stdout.no_fnmatch_line("*.py::test_foo SUBPASSED[[]foo subtest[]]*")
+    record.stdout.no_fnmatch_line("*.py::test_bar SUBPASSED[[]bar subtest[]]*")
 
 
-def test_skip(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
+def _skip_sources() -> types.ModuleType:
+    """The module under test of ``test_skip``."""
+
+    def test_foo(subtests: pytest.Subtests) -> None:
+        with subtests.test("foo subtest"):
+            pytest.skip("skip foo subtest")
+
+    def test_bar(subtests: pytest.Subtests) -> None:
+        with subtests.test("bar subtest"):
+            pytest.skip("skip bar subtest")
+        pytest.skip("skip test_bar")
+
+    return build_module("test_skip", test_foo, test_bar)
+
+
+def test_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        import pytest
-        def test_foo(subtests):
-            with subtests.test("foo subtest"):
-                pytest.skip("skip foo subtest")
-
-        def test_bar(subtests):
-            with subtests.test("bar subtest"):
-                pytest.skip("skip bar subtest")
-            pytest.skip("skip test_bar")
-        """
+    record = run_tests(
+        _skip_sources(), spec=_rendering_spec(tmp_path, "-ra"), capture_output=True
     )
-    result = pytester.runpytest("-ra")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
-            "test_*.py .s    *     [[]100%[]]",
+            # see test_failures on the dropped "[100%]"
+            "test_*.py .s",
             "*=== short test summary info ===*",
-            "SKIPPED [[]1[]] test_skip.py:9: skip test_bar",
+            # the original spelled out "test_skip.py:9" here; the location of
+            # an in-memory source is anchored in *this* file.
+            "SKIPPED [[]1[]] *: skip test_bar",
             "* 1 passed, 1 skipped in *",
         ]
     )
+    record.assert_outcomes(passed=1, skipped=1)
 
-    result = pytester.runpytest("-v", "-ra")
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        _skip_sources(),
+        spec=_rendering_spec(tmp_path, "-v", "-ra"),
+        capture_output=True,
+    )
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo SUBSKIPPED[[]foo subtest[]] (skip foo subtest)  * [[] 50%[]]",
             "*.py::test_foo PASSED                                          * [[] 50%[]]",
@@ -185,15 +258,14 @@ def test_skip(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> Non
             "* 1 passed, 3 skipped in *",
         ]
     )
+    record.assert_outcomes(passed=1, skipped=3)
 
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_subtests = 0
-        """
+    record = run_tests(
+        _skip_sources(),
+        spec=_rendering_spec(tmp_path, "-v", "-ra", verbosity_subtests="0"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v", "-ra")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo PASSED                          * [[] 50%[]]",
             "*.py::test_bar SKIPPED (skip test_bar)         * [[]100%[]]",
@@ -201,42 +273,52 @@ def test_skip(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> Non
             "* 1 passed, 1 skipped in *",
         ]
     )
-    result.stdout.no_fnmatch_line("*.py::test_foo SUBPASSED[[]foo subtest[]]*")
-    result.stdout.no_fnmatch_line("*.py::test_bar SUBPASSED[[]bar subtest[]]*")
-    result.stdout.no_fnmatch_line(
+    record.stdout.no_fnmatch_line("*.py::test_foo SUBPASSED[[]foo subtest[]]*")
+    record.stdout.no_fnmatch_line("*.py::test_bar SUBPASSED[[]bar subtest[]]*")
+    record.stdout.no_fnmatch_line(
         "SUBSKIPPED[[]foo subtest[]] [[]1[]] *.py:*: skip foo subtest"
     )
-    result.stdout.no_fnmatch_line(
+    record.stdout.no_fnmatch_line(
         "SUBSKIPPED[[]foo subtest[]] [[]1[]] *.py:*: skip test_bar"
     )
 
 
-def test_xfail(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        import pytest
-        def test_foo(subtests):
-            with subtests.test("foo subtest"):
-                pytest.xfail("xfail foo subtest")
+def _xfail_sources() -> types.ModuleType:
+    """The module under test of ``test_xfail``."""
 
-        def test_bar(subtests):
-            with subtests.test("bar subtest"):
-                pytest.xfail("xfail bar subtest")
-            pytest.xfail("xfail test_bar")
-        """
+    def test_foo(subtests: pytest.Subtests) -> None:
+        with subtests.test("foo subtest"):
+            pytest.xfail("xfail foo subtest")
+
+    def test_bar(subtests: pytest.Subtests) -> None:
+        with subtests.test("bar subtest"):
+            pytest.xfail("xfail bar subtest")
+        pytest.xfail("xfail test_bar")
+
+    return build_module("test_xfail", test_foo, test_bar)
+
+
+def test_xfail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLUMNS", "120")
+    record = run_tests(
+        _xfail_sources(), spec=_rendering_spec(tmp_path, "-ra"), capture_output=True
     )
-    result = pytester.runpytest("-ra")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
-            "test_*.py .x    *     [[]100%[]]",
+            # see test_failures on the dropped "[100%]"
+            "test_*.py .x",
             "*=== short test summary info ===*",
             "* 1 passed, 1 xfailed in *",
         ]
     )
+    record.assert_outcomes(passed=1, xfailed=1)
 
-    result = pytester.runpytest("-v", "-ra")
-    result.stdout.fnmatch_lines(
+    record = run_tests(
+        _xfail_sources(),
+        spec=_rendering_spec(tmp_path, "-v", "-ra"),
+        capture_output=True,
+    )
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo SUBXFAIL[[]foo subtest[]] (xfail foo subtest)    * [[] 50%[]]",
             "*.py::test_foo PASSED                                           * [[] 50%[]]",
@@ -249,15 +331,14 @@ def test_xfail(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> No
             "* 1 passed, 3 xfailed in *",
         ]
     )
+    record.assert_outcomes(passed=1, xfailed=3)
 
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_subtests = 0
-        """
+    record = run_tests(
+        _xfail_sources(),
+        spec=_rendering_spec(tmp_path, "-v", "-ra", verbosity_subtests="0"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v", "-ra")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo PASSED                          * [[] 50%[]]",
             "*.py::test_bar XFAIL (xfail test_bar)         * [[]100%[]]",
@@ -265,45 +346,49 @@ def test_xfail(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> No
             "* 1 passed, 1 xfailed in *",
         ]
     )
-    result.stdout.no_fnmatch_line(
+    record.stdout.no_fnmatch_line(
         "SUBXFAIL[[]foo subtest[]] *.py::test_foo - xfail foo subtest"
     )
-    result.stdout.no_fnmatch_line(
+    record.stdout.no_fnmatch_line(
         "SUBXFAIL[[]bar subtest[]] *.py::test_bar - xfail bar subtest"
     )
 
 
-def test_typing_exported(pytester: pytest.Pytester) -> None:
-    pytester.makepyfile(
-        """
-        from pytest import Subtests
+def test_typing_exported(tmp_path: Path) -> None:
+    from pytest import Subtests
 
-        def test_typing_exported(subtests: Subtests) -> None:
-            assert isinstance(subtests, Subtests)
-        """
+    def test_typing_exported(subtests: Subtests) -> None:
+        assert isinstance(subtests, Subtests)
+
+    record = run_tests(
+        test_typing_exported, spec=_subtests_spec(tmp_path), name="test_typing_exported"
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["*1 passed*"])
+    record.assert_outcomes(passed=1)
+
+
+def _parametrized_sources() -> types.ModuleType:
+    """The module under test of ``test_subtests_and_parametrization``."""
+
+    @pytest.mark.parametrize("x", [0, 1])
+    def test_foo(subtests: pytest.Subtests, x: int) -> None:
+        for i in range(3):
+            with subtests.test("custom", i=i):
+                assert i % 2 == 0
+        assert x == 0
+
+    return build_module("test_subtests_and_parametrization", test_foo)
 
 
 def test_subtests_and_parametrization(
-    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        import pytest
-
-        @pytest.mark.parametrize("x", [0, 1])
-        def test_foo(subtests, x):
-            for i in range(3):
-                with subtests.test("custom", i=i):
-                    assert i % 2 == 0
-            assert x == 0
-    """
+    record = run_tests(
+        _parametrized_sources(),
+        spec=_rendering_spec(tmp_path, "-v"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo[[]0[]] SUBFAILED[[]custom[]] (i=1) *[[] 50%[]]",
             "*.py::test_foo[[]0[]] FAILED                        *[[] 50%[]]",
@@ -313,15 +398,15 @@ def test_subtests_and_parametrization(
             "* 4 failed, 4 subtests passed in *",
         ]
     )
+    record.assert_outcomes(failed=4)
+    assert record.outcomes()["subtests passed"] == 4
 
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_subtests = 0
-        """
+    record = run_tests(
+        _parametrized_sources(),
+        spec=_rendering_spec(tmp_path, "-v", verbosity_subtests="0"),
+        capture_output=True,
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*.py::test_foo[[]0[]] SUBFAILED[[]custom[]] (i=1) *[[] 50%[]]",
             "*.py::test_foo[[]0[]] FAILED                        *[[] 50%[]]",
@@ -331,51 +416,49 @@ def test_subtests_and_parametrization(
             "* 4 failed in *",
         ]
     )
+    assert "subtests passed" not in record.outcomes()
 
 
-def test_subtests_fail_top_level_test(pytester: pytest.Pytester) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+def test_subtests_fail_top_level_test(tmp_path: Path) -> None:
+    def test_foo(subtests: pytest.Subtests) -> None:
+        for i in range(3):
+            with subtests.test("custom", i=i):
+                assert i % 2 == 0
 
-        def test_foo(subtests):
-            for i in range(3):
-                with subtests.test("custom", i=i):
-                    assert i % 2 == 0
-        """
+    # ``-v`` is a terminal plugin option, which an ensemble only loads when it
+    # is asked to capture output; the ini has the same effect on the category.
+    record = run_tests(
+        test_foo,
+        spec=_subtests_spec(tmp_path, verbosity_subtests="1"),
+        name="test_subtests_fail_top_level_test",
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
-        [
-            "* 2 failed, 2 subtests passed in *",
-        ]
+    # the original read "* 2 failed, 2 subtests passed in *" off the summary
+    record.assert_outcomes(failed=2)
+    assert record.outcomes()["subtests passed"] == 2
+
+
+def test_subtests_do_not_overwrite_top_level_failure(tmp_path: Path) -> None:
+    def test_foo(subtests: pytest.Subtests) -> None:
+        for i in range(3):
+            with subtests.test("custom", i=i):
+                assert i % 2 == 0
+        assert False, "top-level failure"
+
+    record = run_tests(
+        test_foo,
+        spec=_subtests_spec(tmp_path, verbosity_subtests="1"),
+        name="test_subtests_do_not_overwrite_top_level_failure",
     )
+    record.assert_outcomes(failed=2)
+    assert record.outcomes()["subtests passed"] == 2
+    # the top level report keeps its own failure instead of being replaced by
+    # the "contains N failed subtests" one
+    call = record["test_foo"].call
+    assert call is not None
+    assert "AssertionError: top-level failure" in call.longreprtext
 
 
-def test_subtests_do_not_overwrite_top_level_failure(pytester: pytest.Pytester) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
-
-        def test_foo(subtests):
-            for i in range(3):
-                with subtests.test("custom", i=i):
-                    assert i % 2 == 0
-            assert False, "top-level failure"
-        """
-    )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
-        [
-            "*AssertionError: top-level failure",
-            "* 2 failed, 2 subtests passed in *",
-        ]
-    )
-
-
-def test_msg_not_a_string(
-    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_msg_not_a_string(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Using a non-string in subtests.test() should still show it in the terminal (#14195).
 
@@ -383,19 +466,18 @@ def test_msg_not_a_string(
     was added for symmetry.
     """
     monkeypatch.setenv("COLUMNS", "120")
-    pytester.makepyfile(
-        """
-        def test_int_msg(subtests):
-            with subtests.test(42):
-                assert False, "subtest failure"
 
-        def test_no_msg(subtests):
-            with subtests.test():
-                assert False, "subtest failure"
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    def test_int_msg(subtests: pytest.Subtests) -> None:
+        with subtests.test(42):  # type: ignore[arg-type]
+            assert False, "subtest failure"
+
+    def test_no_msg(subtests: pytest.Subtests) -> None:
+        with subtests.test():
+            assert False, "subtest failure"
+
+    module = build_module("test_msg_not_a_string", test_int_msg, test_no_msg)
+    record = run_tests(module, spec=_rendering_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(
         [
             "SUBFAILED[[]42[]] test_msg_not_a_string.py::test_int_msg - AssertionError: subtest failure",
             "SUBFAILED(<subtest>) test_msg_not_a_string.py::test_no_msg - AssertionError: subtest failure",
@@ -404,221 +486,197 @@ def test_msg_not_a_string(
 
 
 @pytest.mark.parametrize("flag", ["--last-failed", "--stepwise"])
-def test_subtests_last_failed_step_wise(pytester: pytest.Pytester, flag: str) -> None:
+def test_subtests_last_failed_step_wise(tmp_path: Path, flag: str) -> None:
     """Check that --last-failed and --step-wise correctly rerun tests with failed subtests."""
-    pytester.makepyfile(
-        """
-        import pytest
 
-        def test_foo(subtests):
-            for i in range(3):
-                with subtests.test("custom", i=i):
-                    assert i % 2 == 0
-        """
+    def test_foo(subtests: pytest.Subtests) -> None:
+        for i in range(3):
+            with subtests.test("custom", i=i):
+                assert i % 2 == 0
+
+    # Both flags read the cache the first run leaves behind in the shared
+    # rootpath, so the two runs have to agree on it. The terminal plugin is
+    # not optional here: what marks the top level test as failed is a *side
+    # effect* of ``pytest_report_teststatus``, and without a terminal nothing
+    # calls that hook while the run is in progress - so the last-failed cache
+    # would never learn about the failure and the flag below would be a no-op.
+    spec = _rendering_spec(tmp_path, "-v").with_plugins("cacheprovider", "stepwise")
+    name = "test_subtests_last_failed_step_wise"
+    record = run_tests(test_foo, spec=spec, name=name, capture_output=True)
+    record.stdout.fnmatch_lines(["* 2 failed, 2 subtests passed in *"])
+    record.assert_outcomes(failed=2)
+    assert record.outcomes()["subtests passed"] == 2
+
+    record = run_tests(
+        test_foo, spec=spec.replace(args=("-v", flag)), name=name, capture_output=True
     )
-    result = pytester.runpytest("-v")
-    result.stdout.fnmatch_lines(
+    # proof the flag had the previous run's state to act on at all
+    record.stdout.fnmatch_lines(
         [
+            {
+                "--last-failed": "run-last-failure: rerun previous 1 failure",
+                # stepwise only records state when it was itself active, and
+                # the first run above was a plain one - same as in the original
+                "--stepwise": "stepwise: no previously failed tests, not skipping.",
+            }[flag],
             "* 2 failed, 2 subtests passed in *",
         ]
     )
-
-    result = pytester.runpytest("-v", flag)
-    result.stdout.fnmatch_lines(
-        [
-            "* 2 failed, 2 subtests passed in *",
-        ]
-    )
+    record.assert_outcomes(failed=2)
+    assert record.outcomes()["subtests passed"] == 2
 
 
 class TestUnittestSubTest:
     """Test unittest.TestCase.subTest functionality."""
 
-    def test_failures(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_failures(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            from unittest import TestCase
 
-            class T(TestCase):
-                def test_foo(self):
-                    with self.subTest("foo subtest"):
-                        assert False, "foo subtest failure"
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                with self.subTest("foo subtest"):
+                    assert False, "foo subtest failure"
 
-                def test_bar(self):
-                    with self.subTest("bar subtest"):
-                        assert False, "bar subtest failure"
-                    assert False, "test_bar also failed"
+            def test_bar(self) -> None:
+                with self.subTest("bar subtest"):
+                    assert False, "bar subtest failure"
+                assert False, "test_bar also failed"
 
-                def test_zaz(self):
-                    with self.subTest("zaz subtest"):
-                        pass
-            """
-        )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
-            [
-                "* 3 failed, 2 passed in *",
-            ]
-        )
+            def test_zaz(self) -> None:
+                with self.subTest("zaz subtest"):
+                    pass
 
-    def test_passes(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+        record = run_tests(T, spec=_subtests_spec(tmp_path))
+        record.assert_outcomes(failed=3, passed=2)
+
+    def test_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            from unittest import TestCase
 
-            class T(TestCase):
-                def test_foo(self):
-                    with self.subTest("foo subtest"):
-                        pass
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                with self.subTest("foo subtest"):
+                    pass
 
-                def test_bar(self):
-                    with self.subTest("bar subtest"):
-                        pass
+            def test_bar(self) -> None:
+                with self.subTest("bar subtest"):
+                    pass
 
-                def test_zaz(self):
-                    with self.subTest("zaz subtest"):
-                        pass
-            """
-        )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
-            [
-                "* 3 passed in *",
-            ]
-        )
+            def test_zaz(self) -> None:
+                with self.subTest("zaz subtest"):
+                    pass
 
-    def test_skip(
-        self,
-        pytester: pytest.Pytester,
-    ) -> None:
-        pytester.makepyfile(
-            """
-            from unittest import TestCase, main
+        record = run_tests(T, spec=_subtests_spec(tmp_path))
+        record.assert_outcomes(passed=3)
 
-            class T(TestCase):
+    def test_skip(self, tmp_path: Path) -> None:
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                for i in range(5):
+                    with self.subTest(msg="custom", i=i):
+                        if i % 2 == 0:
+                            self.skipTest("even number")
 
-                def test_foo(self):
-                    for i in range(5):
-                        with self.subTest(msg="custom", i=i):
-                            if i % 2 == 0:
-                                self.skipTest('even number')
-        """
-        )
         # This output might change #13756.
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["* 1 passed in *"])
+        record = run_tests(T, spec=_subtests_spec(tmp_path))
+        record.assert_outcomes(passed=1)
 
     def test_non_subtest_skip(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            from unittest import TestCase, main
 
-            class T(TestCase):
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                with self.subTest(msg="subtest"):
+                    assert False, "failed subtest"
+                self.skipTest("non-subtest skip")
 
-                def test_foo(self):
-                    with self.subTest(msg="subtest"):
-                        assert False, "failed subtest"
-                    self.skipTest('non-subtest skip')
-        """
-        )
         # This output might change #13756.
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        record = run_tests(
+            T,
+            spec=_rendering_spec(tmp_path),
+            name="test_non_subtest_skip",
+            capture_output=True,
+        )
+        record.stdout.fnmatch_lines(
             [
                 "SUBFAILED[[]subtest[]] test_non_subtest_skip.py::T::test_foo*",
                 "* 1 failed, 1 skipped in *",
             ]
         )
+        record.assert_outcomes(failed=1, skipped=1)
 
-    def test_xfail(
-        self,
-        pytester: pytest.Pytester,
-    ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            from unittest import expectedFailure, TestCase
+    def test_xfail(self, tmp_path: Path) -> None:
+        class T(unittest.TestCase):
+            @unittest.expectedFailure
+            def test_foo(self) -> None:
+                for i in range(5):
+                    with self.subTest(msg="custom", i=i):
+                        if i % 2 == 0:
+                            raise pytest.xfail("even number")
 
-            class T(TestCase):
-                @expectedFailure
-                def test_foo(self):
-                    for i in range(5):
-                        with self.subTest(msg="custom", i=i):
-                            if i % 2 == 0:
-                                raise pytest.xfail('even number')
-
-            if __name__ == '__main__':
-                main()
-        """
-        )
         # This output might change #13756.
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["* 1 xfailed in *"])
+        record = run_tests(T, spec=_subtests_spec(tmp_path))
+        record.assert_outcomes(xfailed=1)
 
     def test_only_original_skip_is_called(
-        self,
-        pytester: pytest.Pytester,
-        monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Regression test for pytest-dev/pytest-subtests#173."""
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            import unittest
-            from unittest import TestCase
 
-            @unittest.skip("skip this test")
-            class T(unittest.TestCase):
-                def test_foo(self):
-                    assert 1 == 2
-        """
+        @unittest.skip("skip this test")
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                # deliberately false; the class level skip must keep it from running
+                assert 1 == 2  # type: ignore[comparison-overlap]
+
+        record = run_tests(
+            T,
+            spec=_rendering_spec(tmp_path, "-v", "-rsf"),
+            name="test_only_original_skip_is_called",
+            capture_output=True,
         )
-        result = pytester.runpytest("-v", "-rsf")
-        result.stdout.fnmatch_lines(
-            ["SKIPPED [1] test_only_original_skip_is_called.py:6: skip this test"]
-        )
+        # the original spelled out "test_only_original_skip_is_called.py:6"
+        # here; the location of an in-memory source is anchored in *this* file.
+        record.stdout.fnmatch_lines(["SKIPPED [[]1[]] *: skip this test"])
+        record.assert_outcomes(skipped=1)
 
     def test_skip_with_failure(
-        self,
-        pytester: pytest.Pytester,
-        monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            import pytest
-            from unittest import TestCase
 
-            class T(TestCase):
-                def test_foo(self):
-                    with self.subTest("subtest 1"):
-                        self.skipTest(f"skip subtest 1")
-                    with self.subTest("subtest 2"):
-                        assert False, "fail subtest 2"
-            """
+        class T(unittest.TestCase):
+            def test_foo(self) -> None:
+                with self.subTest("subtest 1"):
+                    self.skipTest("skip subtest 1")
+                # skipTest() is typed NoReturn, but subTest() swallows the skip
+                with self.subTest("subtest 2"):  # type: ignore[unreachable]
+                    assert False, "fail subtest 2"
+
+        name = "test_skip_with_failure"
+        record = run_tests(
+            T, spec=_rendering_spec(tmp_path, "-ra"), name=name, capture_output=True
         )
-
-        result = pytester.runpytest("-ra")
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
-                "*.py u.                                                           *            [[]100%[]]",
+                # see test_failures on the dropped "[100%]"
+                "*.py u.",
                 "*=== short test summary info ===*",
                 "SUBFAILED[[]subtest 2[]] *.py::T::test_foo - AssertionError: fail subtest 2",
                 "* 1 failed, 1 passed in *",
             ]
         )
+        record.assert_outcomes(failed=1, passed=1)
 
-        result = pytester.runpytest("-v", "-ra")
-        result.stdout.fnmatch_lines(
+        record = run_tests(
+            T,
+            spec=_rendering_spec(tmp_path, "-v", "-ra"),
+            name=name,
+            capture_output=True,
+        )
+        record.stdout.fnmatch_lines(
             [
                 "*.py::T::test_foo SUBSKIPPED[[]subtest 1[]] (skip subtest 1)      *            [[]100%[]]",
                 "*.py::T::test_foo SUBFAILED[[]subtest 2[]]                        *            [[]100%[]]",
@@ -628,15 +686,15 @@ class TestUnittestSubTest:
                 "* 1 failed, 1 passed, 1 skipped in *",
             ]
         )
+        record.assert_outcomes(failed=1, passed=1, skipped=1)
 
-        pytester.makeini(
-            """
-            [pytest]
-            verbosity_subtests = 0
-            """
+        record = run_tests(
+            T,
+            spec=_rendering_spec(tmp_path, "-v", "-ra", verbosity_subtests="0"),
+            name=name,
+            capture_output=True,
         )
-        result = pytester.runpytest("-v", "-ra")
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "*.py::T::test_foo SUBFAILED[[]subtest 2[]]                        *            [[]100%[]]",
                 "*.py::T::test_foo PASSED                                          *            [[]100%[]]",
@@ -645,34 +703,35 @@ class TestUnittestSubTest:
                 r"* 1 failed, 1 passed in *",
             ]
         )
-        result.stdout.no_fnmatch_line(
+        record.stdout.no_fnmatch_line(
             "*.py::T::test_foo SUBSKIPPED[[]subtest 1[]] (skip subtest 1) * [[]100%[]]"
         )
-        result.stdout.no_fnmatch_line(
+        record.stdout.no_fnmatch_line(
             "SUBSKIPPED[[]subtest 1[]] [[]1[]] *.py:*: skip subtest 1"
         )
 
     def test_msg_not_a_string(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Using a non-string in TestCase.subTest should still show it in the terminal (#14195)."""
         monkeypatch.setenv("COLUMNS", "120")
-        pytester.makepyfile(
-            """
-            from unittest import TestCase
 
-            class T(TestCase):
-                def test_int_msg(self):
-                    with self.subTest(42):
-                        assert False, "subtest failure"
+        class T(unittest.TestCase):
+            def test_int_msg(self) -> None:
+                with self.subTest(42):
+                    assert False, "subtest failure"
 
-                def test_no_msg(self):
-                    with self.subTest():
-                        assert False, "subtest failure"
-            """
+            def test_no_msg(self) -> None:
+                with self.subTest():
+                    assert False, "subtest failure"
+
+        record = run_tests(
+            T,
+            spec=_rendering_spec(tmp_path),
+            name="test_msg_not_a_string",
+            capture_output=True,
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "SUBFAILED[[]42[]] test_msg_not_a_string.py::T::test_int_msg - AssertionError: subtest failure",
                 "SUBFAILED(<subtest>) test_msg_not_a_string.py::T::test_no_msg - AssertionError: subtest failure",
@@ -680,6 +739,13 @@ class TestUnittestSubTest:
         )
 
 
+# ensemble: every test in this class needs capture *around the whole item* -
+# the "__ test __" section holding the top level "start test"/"end test"
+# output, ``-s``, and ``capsys``/``capfd``. An ensemble config never runs
+# ``pytest_load_initial_conftests``, so its capture manager never starts
+# global capturing: the subtests' own CaptureFixture still works, but the
+# enclosing test's output is neither captured nor reported - it escapes to
+# the *host's* stdout instead.
 class TestCapture:
     def create_file(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(
@@ -772,31 +838,31 @@ class TestCapture:
 
 
 class TestLogging:
-    def create_file(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile(
-            """
-            import logging
+    def create_module(self) -> types.ModuleType:
+        def test_foo(subtests: pytest.Subtests) -> None:
+            logging.info("before")
 
-            def test_foo(subtests):
-                logging.info("before")
+            with subtests.test("sub1"):
+                print("sub1 stdout")
+                logging.info("sub1 logging")
+                logging.debug("sub1 logging debug")
 
-                with subtests.test("sub1"):
-                    print("sub1 stdout")
-                    logging.info("sub1 logging")
-                    logging.debug("sub1 logging debug")
+            with subtests.test("sub2"):
+                print("sub2 stdout")
+                logging.info("sub2 logging")
+                logging.debug("sub2 logging debug")
+                assert False
 
-                with subtests.test("sub2"):
-                    print("sub2 stdout")
-                    logging.info("sub2 logging")
-                    logging.debug("sub2 logging debug")
-                    assert False
-            """
+        return build_module("test_logging", test_foo)
+
+    def test_capturing_info(self, tmp_path: Path) -> None:
+        # the subtest sections need the capture plugin for stdout and the
+        # logging plugin for the log records; neither is an ensemble default.
+        spec = _rendering_spec(tmp_path, "--log-level=INFO").with_plugins(
+            "logging", "capture"
         )
-
-    def test_capturing_info(self, pytester: pytest.Pytester) -> None:
-        self.create_file(pytester)
-        result = pytester.runpytest("--log-level=INFO")
-        result.stdout.fnmatch_lines(
+        record = run_tests(self.create_module(), spec=spec, capture_output=True)
+        record.stdout.fnmatch_lines(
             [
                 "*___ test_foo [[]sub2[]] __*",
                 "*-- Captured stdout call --*",
@@ -808,13 +874,15 @@ class TestLogging:
                 "*== short test summary info ==*",
             ]
         )
-        result.stdout.no_fnmatch_line("sub1 logging debug")
-        result.stdout.no_fnmatch_line("sub2 logging debug")
+        record.stdout.no_fnmatch_line("sub1 logging debug")
+        record.stdout.no_fnmatch_line("sub2 logging debug")
 
-    def test_capturing_debug(self, pytester: pytest.Pytester) -> None:
-        self.create_file(pytester)
-        result = pytester.runpytest("--log-level=DEBUG")
-        result.stdout.fnmatch_lines(
+    def test_capturing_debug(self, tmp_path: Path) -> None:
+        spec = _rendering_spec(tmp_path, "--log-level=DEBUG").with_plugins(
+            "logging", "capture"
+        )
+        record = run_tests(self.create_module(), spec=spec, capture_output=True)
+        record.stdout.fnmatch_lines(
             [
                 "*___ test_foo [[]sub2[]] __*",
                 "*-- Captured stdout call --*",
@@ -829,55 +897,45 @@ class TestLogging:
             ]
         )
 
-    def test_caplog(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile(
-            """
-            import logging
+    def test_caplog(self, tmp_path: Path) -> None:
+        def test(subtests: pytest.Subtests, caplog: pytest.LogCaptureFixture) -> None:
+            caplog.set_level(logging.INFO)
+            logging.info("start test")
 
-            def test(subtests, caplog):
-                caplog.set_level(logging.INFO)
-                logging.info("start test")
+            with subtests.test("sub1"):
+                logging.info("inside %s", "subtest1")
 
-                with subtests.test("sub1"):
-                    logging.info("inside %s", "subtest1")
+            assert len(caplog.records) == 2
+            assert caplog.records[0].getMessage() == "start test"
+            assert caplog.records[1].getMessage() == "inside subtest1"
 
-                assert len(caplog.records) == 2
-                assert caplog.records[0].getMessage() == "start test"
-                assert caplog.records[1].getMessage() == "inside subtest1"
-            """
+        spec = _subtests_spec(tmp_path).with_plugins("logging")
+        record = run_tests(test, spec=spec, name="test_caplog")
+        record.assert_outcomes(passed=1)
+
+    def test_no_logging(self, tmp_path: Path) -> None:
+        def test(subtests: pytest.Subtests) -> None:
+            logging.info("start log line")
+
+            with subtests.test("sub passing"):
+                logging.info("inside %s", "passing log line")
+
+            with subtests.test("sub failing"):
+                logging.info("inside %s", "failing log line")
+                assert False
+
+            logging.info("end log line")
+
+        # the original passed "-p no:logging"; an ensemble simply never loads
+        # the logging plugin in the first place.
+        record = run_tests(
+            test,
+            spec=_rendering_spec(tmp_path),
+            name="test_no_logging",
+            capture_output=True,
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
-            [
-                "*1 passed*",
-            ]
-        )
-
-    def test_no_logging(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile(
-            """
-            import logging
-
-            def test(subtests):
-                logging.info("start log line")
-
-                with subtests.test("sub passing"):
-                    logging.info("inside %s", "passing log line")
-
-                with subtests.test("sub failing"):
-                    logging.info("inside %s", "failing log line")
-                    assert False
-
-                logging.info("end log line")
-            """
-        )
-        result = pytester.runpytest("-p no:logging")
-        result.stdout.fnmatch_lines(
-            [
-                "*2 failed in*",
-            ]
-        )
-        result.stdout.no_fnmatch_line("*root:test_no_logging.py*log line*")
+        record.assert_outcomes(failed=2)
+        record.stdout.no_fnmatch_line("*root:*log line*")
 
 
 class TestDebugging:
@@ -902,34 +960,28 @@ class TestDebugging:
     def cleanup_calls(self) -> None:
         self._FakePdb.calls.clear()
 
-    def test_pdb_fixture(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pytester.makepyfile(
-            """
-            def test(subtests):
-                with subtests.test():
-                    assert 0
-            """
-        )
-        self.runpytest_and_check_pdb(pytester, monkeypatch)
+    def test_pdb_fixture(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def test(subtests: pytest.Subtests) -> None:
+            with subtests.test():
+                assert 0
+
+        self.run_and_check_pdb(test, tmp_path, monkeypatch)
 
     def test_pdb_unittest(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        pytester.makepyfile(
-            """
-            from unittest import TestCase
-            class Test(TestCase):
-                def test(self):
-                    with self.subTest():
-                        assert 0
-            """
-        )
-        self.runpytest_and_check_pdb(pytester, monkeypatch)
+        class Test(unittest.TestCase):
+            def test(self) -> None:
+                with self.subTest():
+                    assert 0
 
-    def runpytest_and_check_pdb(
-        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+        self.run_and_check_pdb(Test, tmp_path, monkeypatch)
+
+    def run_and_check_pdb(
+        self,
+        source: Source,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Install the fake pdb implementation in _pytest.subtests so we can reference
         # it in the command line (any module would do).
@@ -938,29 +990,35 @@ class TestDebugging:
         monkeypatch.setattr(
             _pytest.subtests, "_CustomPdb", self._FakePdb, raising=False
         )
-        result = pytester.runpytest("--pdb", "--pdbcls=_pytest.subtests:_CustomPdb")
+        spec = _rendering_spec(
+            tmp_path, "--pdb", "--pdbcls=_pytest.subtests:_CustomPdb"
+        ).with_plugins("debugging")
+        record = run_tests(source, spec=spec, name="test_pdb", capture_output=True)
 
         # Ensure pytest entered in debugging mode when encountering the failing
         # assert.
-        result.stdout.fnmatch_lines("*entering PDB*")
+        record.stdout.fnmatch_lines("*entering PDB*")
         assert self._FakePdb.calls == ["init", "reset", "interaction"]
 
 
-def test_exitfirst(pytester: pytest.Pytester) -> None:
+def test_exitfirst(tmp_path: Path) -> None:
     """Validate that when passing --exitfirst the test exits after the first failed subtest."""
-    pytester.makepyfile(
-        """
-        def test_foo(subtests):
-            with subtests.test("sub1"):
-                assert False
 
-            with subtests.test("sub2"):
-                assert False
-        """
+    def test_foo(subtests: pytest.Subtests) -> None:
+        with subtests.test("sub1"):
+            assert False
+
+        with subtests.test("sub2"):
+            assert False
+
+    record = run_tests(
+        test_foo,
+        spec=_rendering_spec(tmp_path, "--exitfirst"),
+        name="test_exitfirst",
+        capture_output=True,
     )
-    result = pytester.runpytest("--exitfirst")
-    assert result.parseoutcomes()["failed"] == 2
-    result.stdout.fnmatch_lines(
+    assert record.outcomes()["failed"] == 2
+    record.stdout.fnmatch_lines(
         [
             "SUBFAILED*[[]sub1[]] *.py::test_foo - assert False*",
             "FAILED *.py::test_foo - assert False",
@@ -968,53 +1026,62 @@ def test_exitfirst(pytester: pytest.Pytester) -> None:
         ],
         consecutive=True,
     )
-    result.stdout.no_fnmatch_line("*sub2*")  # sub2 not executed.
+    record.stdout.no_fnmatch_line("*sub2*")  # sub2 not executed.
 
 
-def test_do_not_swallow_pytest_exit(pytester: pytest.Pytester) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
-        def test(subtests):
-            with subtests.test():
-                pytest.exit()
+def test_do_not_swallow_pytest_exit(tmp_path: Path) -> None:
+    reports: list[TestReport] = []
 
-        def test2(): pass
-        """
-    )
-    result = pytester.runpytest_subprocess()
-    result.stdout.fnmatch_lines(
-        [
-            "* _pytest.outcomes.Exit *",
-            "* 1 failed in *",
-        ]
-    )
+    class ReportRecorder:
+        def pytest_runtest_logreport(self, report: TestReport) -> None:
+            reports.append(report)
+
+    def test(subtests: pytest.Subtests) -> None:
+        with subtests.test():
+            pytest.exit()
+
+    def test2() -> None:
+        pass
+
+    module = build_module("test_do_not_swallow_pytest_exit", test, test2)
+    spec = _subtests_spec(tmp_path).with_plugins(ReportRecorder())
+    # the original observed the Exit escaping as a subprocess traceback; here
+    # it simply has to come back out of the run.
+    with pytest.raises(Exit):
+        run_tests(module, spec=spec)
+    # the subtest was reported as failed, and ``test2`` never ran
+    assert [(report.when, report.outcome) for report in reports] == [
+        ("setup", "passed"),
+        ("call", "failed"),
+    ]
+    assert isinstance(reports[-1], SubtestReport)
+    assert reports[-1].nodeid == "test_do_not_swallow_pytest_exit.py::test"
 
 
-def test_nested(pytester: pytest.Pytester) -> None:
+def test_nested(tmp_path: Path) -> None:
     """
     Currently we do nothing special with nested subtests.
 
     This test only sediments how they work now, we might reconsider adding some kind of nesting support in the future.
     """
-    pytester.makepyfile(
-        """
-        import pytest
-        def test(subtests):
-            with subtests.test("a"):
-                with subtests.test("b"):
-                    assert False, "b failed"
-                assert False, "a failed"
-        """
+
+    def test(subtests: pytest.Subtests) -> None:
+        with subtests.test("a"):
+            with subtests.test("b"):
+                assert False, "b failed"
+            assert False, "a failed"
+
+    record = run_tests(
+        test, spec=_rendering_spec(tmp_path), name="test_nested", capture_output=True
     )
-    result = pytester.runpytest_subprocess()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "SUBFAILED[b] test_nested.py::test - AssertionError: b failed",
             "SUBFAILED[a] test_nested.py::test - AssertionError: a failed",
             "* 3 failed in *",
         ]
     )
+    record.assert_outcomes(failed=3)
 
 
 class MyEnum(Enum):
@@ -1048,6 +1115,8 @@ def test_serialization() -> None:
     )
 
 
+# ensemble: needs xdist, which reruns the tests in worker *subprocesses* over
+# real files on disk (hence the syspathinsert).
 def test_serialization_xdist(pytester: pytest.Pytester) -> None:  # pragma: no cover
     """Regression test for pytest-dev/pytest-xdist#1273."""
     pytest.importorskip("xdist")
