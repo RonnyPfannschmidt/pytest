@@ -1,0 +1,6 @@
+Rendering a traceback entry now parses only the enclosing block rather than the whole source file.
+
+Locating the failing statement requires parsing source into an AST, and that was done for the
+entire file once per rendered entry -- so a failure in a large test module paid for parsing every
+line of it, repeatedly. The parse is now restricted to the block the frame belongs to, falling
+back to the full file where the block cannot be determined.
