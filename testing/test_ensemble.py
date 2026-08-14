@@ -22,11 +22,13 @@ from _pytest.ensemble import ConfigSpec
 from _pytest.ensemble import configured
 from _pytest.ensemble import Ensemble
 from _pytest.ensemble import EnsembleModule
+from _pytest.ensemble import make_tmp_path_factory
 from _pytest.ensemble import module_from_path
 from _pytest.ensemble import run_tests
 from _pytest.ensemble import running_session
 from _pytest.nodes import Collector
 from _pytest.pytester import Pytester
+from _pytest.tmpdir import TempPathFactory
 import pytest
 
 
@@ -933,3 +935,59 @@ class TestPytesterInterplay:
         )
         result = pytester.runpytest_inprocess()
         result.assert_outcomes(passed=1)
+
+
+class TestTmpPath:
+    """``tmpdir`` is opt-in, and only with a factory the caller controls."""
+
+    def test_not_available_by_default(self, tmp_path: Path) -> None:
+        def test_it(tmp_path: Path) -> None:
+            pass
+
+        record = run_tests(test_it, rootpath=tmp_path)
+        record.assert_outcomes(errors=1)
+        setup = record["test_it"].setup
+        assert setup is not None
+        assert "fixture 'tmp_path' not found" in setup.longreprtext
+
+    def test_factory_binds_and_is_used(
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
+    ) -> None:
+        seen: list[Path] = []
+
+        def test_it(tmp_path: Path) -> None:
+            seen.append(tmp_path)
+
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=ensemble_tmp_path_factory)
+        run_tests(test_it, spec=spec).assert_outcomes(passed=1)
+
+        (path,) = seen
+        assert path.is_dir()
+        # Inside the host's own tmp_path, not a base temp of the ensemble's own.
+        assert path.is_relative_to(tmp_path)
+
+    def test_no_basetemp_of_its_own(self, tmp_path: Path) -> None:
+        """The whole point: no numbered dir under ``pytest-of-<user>``."""
+        factory = make_tmp_path_factory(tmp_path / "ensemble-tmp")
+
+        def test_it(tmp_path: Path) -> None:
+            pass
+
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=factory)
+        run_tests(test_it, spec=spec).assert_outcomes(passed=1)
+        assert factory.getbasetemp() == (tmp_path / "ensemble-tmp").resolve()
+
+    def test_factory_is_shared_across_runs(
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
+    ) -> None:
+        """A reused factory keeps handing out fresh directories."""
+        seen: list[Path] = []
+
+        def test_it(tmp_path: Path) -> None:
+            seen.append(tmp_path)
+
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=ensemble_tmp_path_factory)
+        for _ in range(2):
+            run_tests(test_it, spec=spec).assert_outcomes(passed=1)
+
+        assert len(set(seen)) == 2
