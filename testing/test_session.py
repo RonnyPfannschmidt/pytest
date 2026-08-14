@@ -1,11 +1,13 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 from _pytest.config import ExitCode
 from _pytest.ensemble import build_module
 from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import configured
 from _pytest.ensemble import Ensemble
 from _pytest.ensemble import run_tests
 from _pytest.ensemble import RunRecord
@@ -326,11 +328,15 @@ def test_plugin_specify(pytester: Pytester) -> None:
 
 
 # ensemble: same as above - ``-p`` is never consumed by an ensemble config.
-def test_plugin_already_exists(pytester: Pytester) -> None:
-    config = pytester.parseconfig("-p", "terminal")
-    assert config.option.plugins == ["terminal"]
-    config._do_configure()
-    config._ensure_unconfigure()
+def test_plugin_already_exists(tmp_path: Path) -> None:
+    # ``-p terminal`` names a plugin that is loaded already; configure and
+    # unconfigure must both survive it. The stream is a private buffer, since
+    # a loaded terminal plugin would otherwise bind the outer test's stdout.
+    spec = ConfigSpec(
+        rootpath=tmp_path, args=("-p", "terminal"), output=io.StringIO()
+    ).with_plugins("terminal")
+    with configured(spec) as config:
+        assert config.option.plugins == ["terminal"]
 
 
 # ensemble: --ignore excludes filesystem paths from a directory walk.
