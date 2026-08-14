@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tokenize
 from traceback import extract_tb
 from traceback import format_exception
 from traceback import format_exception_only
@@ -284,7 +285,7 @@ class TracebackEntry:
         return self.frame.code.firstlineno
 
     def getsource(
-        self, astcache: dict[str | Path, ast.AST] | None = None
+        self, astcache: dict[tuple[str | Path, int], ast.AST] | None = None
     ) -> Source | None:
         """Return failing source code."""
         # we use the passed in astcache to not reparse asttrees
@@ -292,19 +293,40 @@ class TracebackEntry:
         source = self.frame.code.fullsource
         if source is None:
             return None
+        start = self.getfirstlinesource()
+        # Narrow the parse to the enclosing block: locating one statement is
+        # otherwise O(file), and it is paid once per rendered traceback entry.
+        block, offset = source, 0
+        try:
+            candidate = Source(inspect.getblock(source.raw_lines[start:]))
+        except (OSError, IndentationError, tokenize.TokenError, SyntaxError):
+            pass
+        else:
+            # The block can fall short of the frame: getblock only walks an
+            # indented suite for def/class/decorated code and otherwise stops
+            # at the first logical line, so a module-level frame lands here,
+            # as does exec'd or generated code whose lines do not match.
+            # Only narrow when the reported line is actually inside.
+            if start <= self.lineno < start + len(candidate.lines):
+                block, offset = candidate, start
+        # The key carries the offset, not `start`: whether the block was
+        # narrowed depends on the line being reported, so two entries in the
+        # same function can disagree, and a cached tree must never be paired
+        # with linenos it was not parsed from.
         key = astnode = None
         if astcache is not None:
-            key = self.frame.code.path
-            if key is not None:
+            path = self.frame.code.path
+            if path is not None:
+                key = (path, offset)
                 astnode = astcache.get(key, None)
-        start = self.getfirstlinesource()
         try:
             astnode, _, end = getstatementrange_ast(
-                self.lineno, source, astnode=astnode
+                self.lineno - offset, block, astnode=astnode
             )
         except SyntaxError:
             end = self.lineno + 1
         else:
+            end += offset
             if key is not None and astcache is not None:
                 astcache[key] = astnode
         return source[start:end]
@@ -893,7 +915,7 @@ class ExceptionInfoFormatter:
     truncate_args: bool = True
     chain: bool = True
 
-    astcache: dict[str | Path, ast.AST] = dataclasses.field(
+    astcache: dict[tuple[str | Path, int], ast.AST] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
 
