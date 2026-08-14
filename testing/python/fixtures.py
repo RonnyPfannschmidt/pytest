@@ -25,6 +25,7 @@ from _pytest.pytester import get_public_names
 from _pytest.pytester import LineMatcher
 from _pytest.pytester import Pytester
 from _pytest.python import Function
+from _pytest.tmpdir import TempPathFactory
 import pytest
 
 
@@ -876,7 +877,7 @@ class TestRequestBasic:
         record.assert_outcomes(passed=2)
 
     def test_getfixturevalue_teardown_previously_requested_does_not_warn(
-        self, tmp_path: Path
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
     ) -> None:
         """Test that requesting a fixture during teardown that was previously
         requested is OK (#12882).
@@ -894,7 +895,11 @@ class TestRequestBasic:
             pass
 
         # -Werror of the original: any warning would fail the run.
-        spec = ConfigSpec(rootpath=tmp_path, inicfg={"filterwarnings": ["error"]})
+        spec = ConfigSpec(
+            rootpath=tmp_path,
+            inicfg={"filterwarnings": ["error"]},
+            tmp_path_factory=ensemble_tmp_path_factory,
+        )
         record = run_tests(fix, test_it, spec=spec)
         record.assert_outcomes(passed=1, warnings=0)
 
@@ -928,7 +933,7 @@ class TestRequestBasic:
         record.assert_outcomes(passed=1)
 
     def test_getfixturevalue_teardown_new_inactive_fixture_errors(
-        self, tmp_path: Path
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
     ) -> None:
         """Test that requesting a fixture during teardown that was not
         previously requested raises an error (#12882)."""
@@ -941,7 +946,8 @@ class TestRequestBasic:
         def test_it(fix):
             pass
 
-        record = run_tests(fix, test_it, rootpath=tmp_path)
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=ensemble_tmp_path_factory)
+        record = run_tests(fix, test_it, spec=spec)
         # The call phase passes; the teardown error is a separate report.
         record.assert_outcomes(passed=1, errors=1)
         teardown = record["test_it"].teardown
@@ -952,7 +958,7 @@ class TestRequestBasic:
         )
 
     def test_getfixturevalue_teardown_new_inactive_fixture_errors_top_request(
-        self, tmp_path: Path
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
     ) -> None:
         """Test that requesting a fixture during teardown that was not
         previously requested raises an error (tricky case) (#12882)."""
@@ -960,7 +966,8 @@ class TestRequestBasic:
         def test_it(request):
             request.addfinalizer(lambda: request.getfixturevalue("tmp_path"))
 
-        record = run_tests(test_it, rootpath=tmp_path)
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=ensemble_tmp_path_factory)
+        record = run_tests(test_it, spec=spec)
         record.assert_outcomes(passed=1, errors=1)
         teardown = record["test_it"].teardown
         assert teardown is not None
@@ -1152,7 +1159,9 @@ class TestRequestBasic:
             req = TopRequest(item, _ispytest=True)
             assert req.path == modcol.path
 
-    def test_request_fixturenames(self, tmp_path: Path) -> None:
+    def test_request_fixturenames(
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
+    ) -> None:
         @pytest.fixture
         def arg1():
             pass
@@ -1175,7 +1184,8 @@ class TestRequestBasic:
                 "tmp_path_factory",
             }
 
-        record = run_tests(arg1, farg, sarg, test_function, rootpath=tmp_path)
+        spec = ConfigSpec(rootpath=tmp_path, tmp_path_factory=ensemble_tmp_path_factory)
+        record = run_tests(arg1, farg, sarg, test_function, spec=spec)
         record.assert_outcomes(passed=1)
 
     def test_request_fixturenames_dynamic_fixture(self) -> None:
@@ -2117,7 +2127,9 @@ class TestAutouseDiscovery:
         return pytester
 
     @pytest.fixture
-    def spec(self, tmp_path: Path) -> ConfigSpec:
+    def spec(
+        self, tmp_path: Path, ensemble_tmp_path_factory: TempPathFactory
+    ) -> ConfigSpec:
         """The rootdir conftest of this class, as a plugin object."""
 
         class ConftestPlugin:
@@ -2141,7 +2153,11 @@ class TestAutouseDiscovery:
             def item(self, request):
                 return request._pyfuncitem
 
-        return ConfigSpec(rootpath=tmp_path, extra_plugins=(ConftestPlugin(),))
+        return ConfigSpec(
+            rootpath=tmp_path,
+            extra_plugins=(ConftestPlugin(),),
+            tmp_path_factory=ensemble_tmp_path_factory,
+        )
 
     def test_parsefactories_conftest(self, spec: ConfigSpec) -> None:
         def test_check_setup(item, fm):
