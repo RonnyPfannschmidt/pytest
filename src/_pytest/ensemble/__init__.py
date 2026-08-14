@@ -70,6 +70,7 @@ from _pytest.ensemble.collection import Source
 from _pytest.ensemble.config import ConfigSpec
 from _pytest.ensemble.config import configured
 from _pytest.ensemble.config import DEFAULT_PLUGINS
+from _pytest.ensemble.config import make_tmp_path_factory
 from _pytest.ensemble.results import ensure_recorder
 from _pytest.ensemble.results import ItemRecord
 from _pytest.ensemble.results import run_items
@@ -99,6 +100,7 @@ __all__ = [
     "collect_sources",
     "collect_tests",
     "configured",
+    "make_tmp_path_factory",
     "module_from_path",
     "run_items",
     "run_tests",
