@@ -99,11 +99,7 @@ def test_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     record.stdout.fnmatch_lines(
         [
-            # The original also matched a trailing "[100%]" here. The terminal
-            # reporter defers that final fill to ``pytest_runtestloop``, which
-            # an ensemble never calls - it drives the items directly. The
-            # per-test letters, which are what this test is about, are intact.
-            "test_*.py uFuF.",
+            "test_*.py uFuF.*[[]100%[]]",
             *summary_lines,
             "* 4 failed, 1 passed in *",
         ]
@@ -170,8 +166,7 @@ def test_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     record.stdout.fnmatch_lines(
         [
-            # see test_failures on the dropped "[100%]"
-            "test_*.py ..",
+            "test_*.py ..*[[]100%[]]",
             "* 2 passed in *",
         ]
     )
@@ -229,8 +224,7 @@ def test_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     record.stdout.fnmatch_lines(
         [
-            # see test_failures on the dropped "[100%]"
-            "test_*.py .s",
+            "test_*.py .s*[[]100%[]]",
             "*=== short test summary info ===*",
             # the original spelled out "test_skip.py:9" here; the location of
             # an in-memory source is anchored in *this* file.
@@ -305,8 +299,7 @@ def test_xfail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     record.stdout.fnmatch_lines(
         [
-            # see test_failures on the dropped "[100%]"
-            "test_*.py .x",
+            "test_*.py .x*[[]100%[]]",
             "*=== short test summary info ===*",
             "* 1 passed, 1 xfailed in *",
         ]
@@ -662,7 +655,7 @@ class TestUnittestSubTest:
         record.stdout.fnmatch_lines(
             [
                 # see test_failures on the dropped "[100%]"
-                "*.py u.",
+                "*.py u.*[[]100%[]]",
                 "*=== short test summary info ===*",
                 "SUBFAILED[[]subtest 2[]] *.py::T::test_foo - AssertionError: fail subtest 2",
                 "* 1 failed, 1 passed in *",
