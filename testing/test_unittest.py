@@ -12,11 +12,16 @@ from _pytest.config import ExitCode
 from _pytest.ensemble import build_module
 from _pytest.ensemble import collect_tests
 from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import module_from_path
 from _pytest.ensemble import run_tests
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.outcomes import Exit
 from _pytest.pytester import Pytester
 import pytest
+
+
+#: The example scripts, run as themselves rather than copied somewhere first.
+EXAMPLES = Path(__file__).parent / "example_scripts"
 
 
 def test_simple_unittest(tmp_path: Path) -> None:
@@ -1130,12 +1135,11 @@ def test_testcase_handles_init_exceptions(tmp_path: Path) -> None:
     assert record.reports == []
 
 
-# ensemble: driven by an example script; an in-memory copy would orphan
-# testing/example_scripts/unittest/test_parametrized_fixture_error_message.py
-def test_error_message_with_parametrized_fixtures(pytester: Pytester) -> None:
-    pytester.copy_example("unittest/test_parametrized_fixture_error_message.py")
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+def test_error_message_with_parametrized_fixtures() -> None:
+    example = EXAMPLES / "unittest/test_parametrized_fixture_error_message.py"
+    module = module_from_path(example)
+    record = run_tests(module, rootpath=example.parent, capture_output=True)
+    record.stdout.fnmatch_lines(
         [
             "*test_two does not support fixtures*",
             "*TestSomethingElse::test_two",
@@ -1144,23 +1148,21 @@ def test_error_message_with_parametrized_fixtures(pytester: Pytester) -> None:
     )
 
 
-# ensemble: driven by example scripts; in-memory copies would orphan
-# testing/example_scripts/unittest/test_setup_skip*.py
 @pytest.mark.parametrize(
-    "test_name, expected_outcome",
+    "test_name, expected_outcome, outcomes",
     [
-        ("test_setup_skip.py", "1 skipped"),
-        ("test_setup_skip_class.py", "1 skipped"),
-        ("test_setup_skip_module.py", "1 error"),
+        ("test_setup_skip.py", "1 skipped", {"skipped": 1}),
+        ("test_setup_skip_class.py", "1 skipped", {"skipped": 1}),
+        ("test_setup_skip_module.py", "1 error", {"errors": 1}),
     ],
 )
-def test_setup_inheritance_skipping(
-    pytester: Pytester, test_name, expected_outcome
-) -> None:
+def test_setup_inheritance_skipping(test_name, expected_outcome, outcomes) -> None:
     """Issue #4700"""
-    pytester.copy_example(f"unittest/{test_name}")
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines([f"* {expected_outcome} in *"])
+    example = EXAMPLES / "unittest" / test_name
+    module = module_from_path(example)
+    record = run_tests(module, rootpath=example.parent, capture_output=True)
+    record.stdout.fnmatch_lines([f"* {expected_outcome} in *"])
+    record.assert_outcomes(**outcomes)
 
 
 def test_BdbQuit(tmp_path: Path) -> None:
@@ -1305,30 +1307,27 @@ def test_pdb_teardown_skipped_for_classes(tmp_path: Path, mark) -> None:
     assert tracked == []
 
 
-# ensemble: driven by an example script; an in-memory copy would orphan
-# testing/example_scripts/unittest/test_unittest_asyncio.py
-def test_async_support(pytester: Pytester) -> None:
+def test_async_support() -> None:
     pytest.importorskip("unittest.async_case")
 
-    pytester.copy_example("unittest/test_unittest_asyncio.py")
-    reprec = pytester.inline_run()
-    reprec.assertoutcome(failed=1, passed=2)
+    example = EXAMPLES / "unittest/test_unittest_asyncio.py"
+    module = module_from_path(example)
+    run_tests(module, rootpath=example.parent).assert_outcomes(failed=1, passed=2)
 
 
-# ensemble: driven by an example script; an in-memory copy would orphan
-# testing/example_scripts/unittest/test_unittest_asynctest.py
 @pytest.mark.skipif(
     sys.version_info >= (3, 11), reason="asynctest is not compatible with Python 3.11+"
 )
-def test_asynctest_support(pytester: Pytester) -> None:
+def test_asynctest_support() -> None:
     """Check asynctest support (#7110)"""
     pytest.importorskip("asynctest")
-    pytester.copy_example("unittest/test_unittest_asynctest.py")
-    reprec = pytester.inline_run()
-    reprec.assertoutcome(failed=1, passed=2)
+    example = EXAMPLES / "unittest/test_unittest_asynctest.py"
+    module = module_from_path(example)
+    run_tests(module, rootpath=example.parent).assert_outcomes(failed=1, passed=2)
 
 
-# ensemble: needs a subprocess (the unawaited coroutine warning depends on gc)
+# ensemble: needs a subprocess (the unawaited coroutine warning depends on gc),
+# so the example script has to be copied somewhere the subprocess can run it.
 def test_plain_unittest_does_not_support_async(pytester: Pytester) -> None:
     """Async functions in plain unittest.TestCase subclasses are not supported without plugins.
 

@@ -13,6 +13,7 @@ from _pytest.ensemble import build_module
 from _pytest.ensemble import collect_tests
 from _pytest.ensemble import ConfigSpec
 from _pytest.ensemble import Ensemble
+from _pytest.ensemble import module_from_path
 from _pytest.ensemble import run_tests
 from _pytest.fixtures import deduplicate_names
 from _pytest.fixtures import ParamValueKey
@@ -21,6 +22,7 @@ from _pytest.mark.structures import Mark
 from _pytest.mark.structures import MarkDecorator
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.pytester import get_public_names
+from _pytest.pytester import LineMatcher
 from _pytest.pytester import Pytester
 from _pytest.python import Function
 import pytest
@@ -34,6 +36,11 @@ def unregistered_mark(name: str, *args: object, **kwargs: object) -> MarkDecorat
     unregistered mark applied to an ensemble source has to be built directly.
     """
     return MarkDecorator(Mark(name, args, kwargs, _ispytest=True), _ispytest=True)
+
+
+#: The example scripts, run as themselves rather than copied somewhere first.
+EXAMPLES = Path(__file__).parent.parent / "example_scripts"
+FILL_FIXTURES = EXAMPLES / "fixtures/fill_fixtures"
 
 
 def test_getfuncargnames_functions():
@@ -151,59 +158,42 @@ def test_getfuncargnames_staticmethod_partial():
 
 @pytest.mark.pytester_example_path("fixtures/fill_fixtures")
 class TestFillFixtures:
-    def test_funcarg_lookupfails(self, tmp_path: Path) -> None:
-        @pytest.fixture
-        def xyzsomething(request):
-            return 42
-
-        def test_func(some):
-            pass
-
+    def test_funcarg_lookupfails(self) -> None:
+        example = FILL_FIXTURES / "test_funcarg_lookupfails.py"
         record = run_tests(
-            xyzsomething, test_func, rootpath=tmp_path, capture_output=True
+            module_from_path(example), rootpath=example.parent, capture_output=True
         )
         # A fixture missing at setup is an error, not a failure.
         record.assert_outcomes(errors=1)
         record.stdout.fnmatch_lines(
             [
+                # The example is reported at its own path and line, not at
+                # this file's - that is what running it as itself buys.
+                "file *test_funcarg_lookupfails.py, line 12",
                 "*def test_func(some)*",
                 "*fixture*some*not found*",
                 "*xyzsomething*",
             ]
         )
 
-    def test_detect_recursive_dependency_error(self, tmp_path: Path) -> None:
-        @pytest.fixture
-        def fix1(fix2):
-            return 1
-
-        @pytest.fixture
-        def fix2(fix1):
-            return 1
-
-        def test(fix1):
-            pass
-
-        record = run_tests(fix1, fix2, test, rootpath=tmp_path, capture_output=True)
+    def test_detect_recursive_dependency_error(self) -> None:
+        example = FILL_FIXTURES / "test_detect_recursive_dependency_error.py"
+        record = run_tests(
+            module_from_path(example), rootpath=example.parent, capture_output=True
+        )
+        record.assert_outcomes(errors=1)
         record.stdout.fnmatch_lines(
             ["*recursive dependency involving fixture 'fix1' detected*"]
         )
 
-    def test_funcarg_basic(self, tmp_path: Path) -> None:
-        @pytest.fixture
-        def some(request):
-            return request.function.__name__
-
-        @pytest.fixture
-        def other(request):
-            return 42
-
-        def test_func(some, other):
-            pass
-
-        with Ensemble(some, other, test_func, rootpath=tmp_path) as ensemble:
+    def test_funcarg_basic(self) -> None:
+        example = FILL_FIXTURES / "test_funcarg_basic.py"
+        with Ensemble(module_from_path(example), rootpath=example.parent) as ensemble:
             (item,) = ensemble.collect()
             assert isinstance(item, Function)
+            # The example is collected where it lives, so it keeps its identity.
+            assert item.nodeid == "test_funcarg_basic.py::test_func"
+            assert item.path == example
             # Execute's item's setup, which fills fixtures.
             item.session._setupstate.setup(item)
             del item.funcargs["request"]
@@ -211,35 +201,24 @@ class TestFillFixtures:
             assert item.funcargs["some"] == "test_func"
             assert item.funcargs["other"] == 42
 
-    def test_funcarg_lookup_modulelevel(self, tmp_path: Path) -> None:
-        @pytest.fixture
-        def something(request):
-            return request.function.__name__
-
-        class TestClass:
-            def test_method(self, something):
-                assert something == "test_method"
-
-        def test_func(something):
-            assert something == "test_func"
-
-        record = run_tests(something, TestClass, test_func, rootpath=tmp_path)
+    def test_funcarg_lookup_modulelevel(self) -> None:
+        example = FILL_FIXTURES / "test_funcarg_lookup_modulelevel.py"
+        record = run_tests(module_from_path(example), rootpath=example.parent)
         record.assert_outcomes(passed=2)
+        assert sorted(record.by_test) == [
+            "test_funcarg_lookup_modulelevel.py::TestClass::test_method",
+            "test_funcarg_lookup_modulelevel.py::test_func",
+        ]
 
-    def test_funcarg_lookup_classlevel(self, tmp_path: Path) -> None:
-        class TestClass:
-            @pytest.fixture
-            def something(self, request):
-                return request.instance
-
-            def test_method(self, something):
-                assert something is self
-
-        record = run_tests(TestClass, rootpath=tmp_path)
+    def test_funcarg_lookup_classlevel(self) -> None:
+        example = FILL_FIXTURES / "test_funcarg_lookup_classlevel.py"
+        record = run_tests(module_from_path(example), rootpath=example.parent)
         record.assert_outcomes(passed=1)
 
     # ensemble: conftest visibility is per-directory, and ensembles have no
-    # directory tree below the rootdir to scope conftests to.
+    # directory tree below the rootdir to scope conftests to. Running the
+    # example modules in place does not help: the conftests beside them are
+    # exactly what is under test, and ensembles never load conftest files.
     def test_conftest_funcargs_only_available_in_subdir(
         self, pytester: Pytester
     ) -> None:
@@ -247,46 +226,29 @@ class TestFillFixtures:
         result = pytester.runpytest("-v")
         result.assert_outcomes(passed=2)
 
-    def test_extend_fixture_module_class(self, tmp_path: Path) -> None:
-        @pytest.fixture
-        def spam():
-            return "spam"
-
-        class TestSpam:
-            @pytest.fixture
-            def spam(self, spam):
-                return spam * 2
-
-            def test_spam(self, spam):
-                assert spam == "spamspam"
-
-        record = run_tests(spam, TestSpam, rootpath=tmp_path)
+    def test_extend_fixture_module_class(self) -> None:
+        example = FILL_FIXTURES / "test_extend_fixture_module_class.py"
+        record = run_tests(module_from_path(example), rootpath=example.parent)
         record.assert_outcomes(passed=1)
+        assert record["test_extend_fixture_module_class.py::TestSpam::test_spam"].passed
 
-    def test_extend_fixture_conftest_module(self, tmp_path: Path) -> None:
-        # The rootdir conftest is reproduced as a plugin object; the second
-        # run of the original (passing the test file directly) only covered
-        # conftest collection for an explicit file argument, which an
-        # ensemble has no equivalent of.
-        class ConftestPlugin:
-            @pytest.fixture
-            def spam(self):
-                return "spam"
-
-        @pytest.fixture
-        def spam(spam):
-            return spam * 2
-
-        def test_spam(spam):
-            assert spam == "spamspam"
-
-        spec = ConfigSpec(rootpath=tmp_path, extra_plugins=(ConftestPlugin(),))
-        record = run_tests(
-            build_module("test_extend", spam=spam, test_spam=test_spam), spec=spec
-        )
+    def test_extend_fixture_conftest_module(self) -> None:
+        # The example's conftest sits at its root, which is exactly what an
+        # ensemble plugin object stands for - so the conftest and the test
+        # module can both be run as themselves. The second run of the
+        # original (passing the test file directly) only covered conftest
+        # collection for an explicit file argument, which an ensemble has no
+        # equivalent of.
+        example_dir = FILL_FIXTURES / "test_extend_fixture_conftest_module"
+        conftest = module_from_path(example_dir / "conftest.py")
+        example = example_dir / "test_extend_fixture_conftest_module.py"
+        spec = ConfigSpec(rootpath=example_dir, extra_plugins=(conftest,))
+        record = run_tests(module_from_path(example), spec=spec)
         record.assert_outcomes(passed=1)
+        assert record["test_extend_fixture_conftest_module.py::test_spam"].passed
 
-    # ensemble: two conftests at different directory levels.
+    # ensemble: two conftests at different directory levels; running the
+    # example module in place would not load either of them.
     def test_extend_fixture_conftest_conftest(self, pytester: Pytester) -> None:
         p = pytester.copy_example()
         result = pytester.runpytest()
@@ -1185,26 +1147,12 @@ class TestRequestBasic:
         record = run_tests(arg1, farg, sarg, test_function, rootpath=tmp_path)
         record.assert_outcomes(passed=1)
 
-    def test_request_fixturenames_dynamic_fixture(self, tmp_path: Path) -> None:
+    def test_request_fixturenames_dynamic_fixture(self) -> None:
         """Regression test for #3057"""
-
-        @pytest.fixture
-        def dynamic():
-            pass
-
-        @pytest.fixture
-        def a(request):
-            request.getfixturevalue("dynamic")
-
-        @pytest.fixture
-        def b(a):
-            pass
-
-        def test(b, request):
-            assert request.fixturenames == ["b", "a", "request", "dynamic"]
-
-        record = run_tests(dynamic, a, b, test, rootpath=tmp_path)
+        example = EXAMPLES / "fixtures/test_getfixturevalue_dynamic.py"
+        record = run_tests(module_from_path(example), rootpath=example.parent)
         record.assert_outcomes(passed=1)
+        assert record["test_getfixturevalue_dynamic.py::test"].passed
 
     def test_setupdecorator_and_xunit(self, tmp_path: Path) -> None:
         values: list[str] = []
@@ -2100,7 +2048,8 @@ class TestFixtureManagerParseFactories:
         reprec.assertoutcome(passed=2)
 
     # ensemble: the example is a directory tree with a conftest defining
-    # custom collectors for non-python files.
+    # custom collectors for non-python files. The items under test are not
+    # python at all, so there is no module to run in place.
     def test_collect_custom_items(self, pytester: Pytester) -> None:
         pytester.copy_example("fixtures/custom_item")
         result = pytester.runpytest("foo")
@@ -5151,11 +5100,15 @@ def test_fixture_param_shadowing(tmp_path: Path) -> None:
     ]
 
 
-# ensemble: asserts the file:line the reserved fixture name was used at.
-def test_fixture_named_request(pytester: Pytester) -> None:
-    pytester.copy_example("fixtures/test_fixture_named_request.py")
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+def test_fixture_named_request() -> None:
+    # The reserved name is rejected by the decorator, so importing the example
+    # is what raises - there is nothing left to collect afterwards. Importing
+    # it as itself is what makes the reported location the example's own line;
+    # an inlined copy would name this file instead.
+    example = EXAMPLES / "fixtures/test_fixture_named_request.py"
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        module_from_path(example)
+    LineMatcher(str(excinfo.value).splitlines()).fnmatch_lines(
         [
             "*'request' is a reserved word for fixtures, use another name:",
             "  *test_fixture_named_request.py:8",
