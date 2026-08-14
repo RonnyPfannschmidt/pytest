@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from _pytest.compat import LEGACY_PATH
+from _pytest.ensemble import collect_tests
+from _pytest.ensemble import ConfigSpec
 from _pytest.fixtures import TopRequest
 from _pytest.legacypath import TempdirFactory
 from _pytest.legacypath import Testdir
@@ -91,10 +93,15 @@ def test_cache_makedir(cache: pytest.Cache) -> None:
     dir.remove()
 
 
-def test_fixturerequest_getmodulepath(pytester: pytest.Pytester) -> None:
-    modcol = pytester.getmodulecol("def test_somefunc(): pass")
-    (item,) = pytester.genitems([modcol])
+def test_fixturerequest_getmodulepath(tmp_path: Path) -> None:
+    def test_somefunc() -> None:
+        pass
+
+    spec = ConfigSpec(rootpath=tmp_path).with_plugins("legacypath")
+    (item,) = collect_tests(test_somefunc, spec=spec)
     assert isinstance(item, pytest.Function)
+    modcol = item.parent
+    assert modcol is not None
     req = TopRequest(item, _ispytest=True)
     assert req.path == modcol.path
     assert req.fspath == modcol.fspath  # type: ignore[attr-defined]
