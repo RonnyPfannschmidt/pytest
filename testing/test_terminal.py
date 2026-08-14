@@ -963,11 +963,13 @@ class TestTerminalFunctional:
         def test_skip():
             pytest.skip("dontshow")
 
+        # `--tb=no`: only the absence of a skip summary is asserted on; see
+        # TestProgressWithTeardown for why rendering the traceback is costly.
         record = run_tests(
             test_ok,
             test_fail,
             test_skip,
-            rootpath=tmp_path,
+            spec=ConfigSpec(rootpath=tmp_path, args=("--tb=no",)),
             name="test_no_skip_summary_if_failure",
             capture_output=True,
         )
@@ -1233,8 +1235,11 @@ class TestTerminalFunctional:
             def test_skip(self):
                 pytest.skip("hello")
 
+        # `--tb=no`: the `-v` per-test lines are the point; see
+        # TestProgressWithTeardown for why rendering the traceback is costly.
         spec = ConfigSpec(
-            rootpath=tmp_path, args=("-v", "-Walways::pytest.PytestWarning")
+            rootpath=tmp_path,
+            args=("-v", "--tb=no", "-Walways::pytest.PytestWarning"),
         )
         record = run_tests(
             test_fail,
@@ -1328,7 +1333,9 @@ class TestTerminalFunctional:
         def test():
             assert False
 
-        spec = ConfigSpec(rootpath=tmp_path, args=("-rfF",))
+        # `--tb=no`: the asserted line is the short summary one, built from
+        # `longrepr.reprcrash`, which `--tb=no` still produces.
+        spec = ConfigSpec(rootpath=tmp_path, args=("-rfF", "--tb=no"))
         record = run_tests(
             test, spec=spec, name="test_summary_f_alias", capture_output=True
         )
@@ -1414,16 +1421,19 @@ def test_fail_extra_reporting(
     def test_this():
         assert 0, "this_failed" * 100
 
+    # `--tb=no`: the short summary line is what is asserted on, and it is built
+    # from `longrepr.reprcrash`, which `--tb=no` still produces. Rendering the
+    # traceback would re-parse this whole file (see TestProgressWithTeardown).
     record = run_tests(
         test_this,
-        spec=ConfigSpec(rootpath=tmp_path, args=("-rN",)),
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rN", "--tb=no")),
         name="test_fail_extra_reporting",
         capture_output=True,
     )
     record.stdout.no_fnmatch_line("*short test summary*")
     record = run_tests(
         test_this,
-        rootpath=tmp_path,
+        spec=ConfigSpec(rootpath=tmp_path, args=("--tb=no",)),
         name="test_fail_extra_reporting",
         capture_output=True,
     )
@@ -1473,7 +1483,7 @@ def test_pass_reporting_on_fail(tmp_path: Path) -> None:
 
     record = run_tests(
         test_this,
-        spec=ConfigSpec(rootpath=tmp_path, args=("-rp",)),
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rp", "--tb=no")),
         capture_output=True,
     )
     record.stdout.no_fnmatch_line("*short test summary*")
@@ -2120,9 +2130,12 @@ def test_terminal_no_summary_warnings_header_once(tmp_path: Path) -> None:
         warnings.warn("warning_from_" + "test")
         assert 0
 
+    # `--tb=no` renders identically here - `--no-summary` already suppresses
+    # the FAILURES section - but skips the failure repr, which would re-parse
+    # this whole file (see TestProgressWithTeardown).
     spec = ConfigSpec(
         rootpath=tmp_path,
-        args=("--no-summary",),
+        args=("--no-summary", "--tb=no"),
         inicfg={"filterwarnings": ["default"]},
     )
     record = run_tests(
@@ -2349,8 +2362,12 @@ class TestClassicOutputStyle:
 
     @staticmethod
     def _run(tmp_path: Path, test_files, *args: str):
+        # `--tb=no`: only the progress and summary lines are asserted on, and
+        # rendering the tracebacks of the two failures would re-parse the whole
+        # of this file (see TestProgressWithTeardown).
         spec = ConfigSpec(
-            rootpath=tmp_path, args=("-o", "console_output_style=classic", *args)
+            rootpath=tmp_path,
+            args=("-o", "console_output_style=classic", "--tb=no", *args),
         )
         return run_tests(*test_files, spec=spec, capture_output=True)
 
@@ -2529,7 +2546,10 @@ class TestProgressOutputStyle:
         # The host suite turns warnings into errors; the point here is the
         # yellow progress indicator a *recorded* warning produces.
         inicfg: dict[str, object] = {"filterwarnings": ["always"]}
-        record = self._run(tmp_path, sources, inicfg=inicfg)
+        # `--tb=no`: the progress indicators are the point; rendering the five
+        # ValueError tracebacks would re-parse this file five times over (see
+        # TestProgressWithTeardown).
+        record = self._run(tmp_path, sources, "--tb=no", inicfg=inicfg)
         record.stdout.re_match_lines(
             color_mapping.format_for_rematch(
                 [
@@ -2543,7 +2563,7 @@ class TestProgressOutputStyle:
         record.assert_outcomes(passed=15, failed=5, xfailed=1, warnings=5)
 
         # Only xfail should have yellow progress indicator.
-        record = self._run(tmp_path, (axfail_module,))
+        record = self._run(tmp_path, (axfail_module,), "--tb=no")
         record.stdout.re_match_lines(
             color_mapping.format_for_rematch(
                 [
@@ -2772,7 +2792,16 @@ class TestProgressOutputStyle:
 
 
 class TestProgressWithTeardown:
-    """Ensure we show the correct percentages for tests that fail during teardown (#3088)"""
+    """Ensure we show the correct percentages for tests that fail during teardown (#3088)
+
+    ``--tb=no`` where no traceback is asserted on: an ensemble item's code
+    object belongs to *this* file, so every failure repr re-parses the whole
+    of ``test_terminal.py`` to find its statement range (~40ms each, and
+    ``test_teardown_many`` produces twenty of them). Suppressing the
+    traceback skips ``Node.repr_failure``'s source lookup entirely; the
+    progress column, the short summary and the report objects these tests do
+    assert on are all unaffected.
+    """
 
     @pytest.fixture
     def teardown_fixture_plugin(self) -> object:
@@ -2838,7 +2867,9 @@ class TestProgressWithTeardown:
         record = run_tests(
             test_foo,
             spec=ConfigSpec(
-                rootpath=tmp_path, extra_plugins=(teardown_fixture_plugin,)
+                rootpath=tmp_path,
+                args=("--tb=no",),
+                extra_plugins=(teardown_fixture_plugin,),
             ),
             name="test_teardown_simple",
             capture_output=True,
@@ -2857,7 +2888,7 @@ class TestProgressWithTeardown:
             test_foo,
             spec=ConfigSpec(
                 rootpath=tmp_path,
-                args=("-rfE",),
+                args=("-rfE", "--tb=no"),
                 extra_plugins=(teardown_fixture_plugin,),
             ),
             name="test_teardown_with_test_also_failing",
@@ -2878,7 +2909,9 @@ class TestProgressWithTeardown:
         record = run_tests(
             *many_sources,
             spec=ConfigSpec(
-                rootpath=tmp_path, extra_plugins=(teardown_fixture_plugin,)
+                rootpath=tmp_path,
+                args=("--tb=no",),
+                extra_plugins=(teardown_fixture_plugin,),
             ),
             capture_output=True,
         )
@@ -2894,7 +2927,7 @@ class TestProgressWithTeardown:
             *many_sources,
             spec=ConfigSpec(
                 rootpath=tmp_path,
-                args=("-v",),
+                args=("-v", "--tb=no"),
                 extra_plugins=(teardown_fixture_plugin,),
             ),
             capture_output=True,
@@ -3489,10 +3522,15 @@ class TestFineGrainedTestCase:
     def _run(
         module: ModuleType, tmp_path: Path, verbosity: int, *args: str
     ) -> RunRecord:
-        """Run *module* with ``verbosity_test_cases`` set, capturing output."""
+        """Run *module* with ``verbosity_test_cases`` set, capturing output.
+
+        ``--tb=no``: every case here asserts a consecutive block of collect and
+        progress lines, never a traceback, and rendering the one failure would
+        re-parse this whole file (see TestProgressWithTeardown).
+        """
         spec = ConfigSpec(
             rootpath=tmp_path,
-            args=args,
+            args=("--tb=no", *args),
             inicfg={"verbosity_test_cases": str(verbosity)},
         )
         return run_tests(module, spec=spec, capture_output=True)
@@ -3728,10 +3766,13 @@ def test_summary_xfail_reason(tmp_path: Path) -> None:
     def test_xfail_reason():
         assert False
 
+    # `--tb=no` renders identically here - XFAILURES is already suppressed
+    # without `--xfail-tb` - but skips the failure repr, which would re-parse
+    # this whole file twice (see TestProgressWithTeardown).
     record = run_tests(
         test_xfail,
         test_xfail_reason,
-        spec=ConfigSpec(rootpath=tmp_path, args=("-rx",)),
+        spec=ConfigSpec(rootpath=tmp_path, args=("-rx", "--tb=no")),
         name="test_summary_xfail_reason",
         capture_output=True,
     )
