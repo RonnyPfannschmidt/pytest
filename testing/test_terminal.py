@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import textwrap
+from types import ModuleType
 from types import SimpleNamespace
 from typing import cast
 from typing import Literal
@@ -24,6 +25,7 @@ from _pytest.ensemble import build_module
 from _pytest.ensemble import ConfigSpec
 from _pytest.ensemble import Ensemble
 from _pytest.ensemble import run_tests
+from _pytest.ensemble import RunRecord
 from _pytest.mark.structures import Mark
 from _pytest.mark.structures import MarkDecorator
 from _pytest.monkeypatch import MonkeyPatch
@@ -1518,9 +1520,10 @@ def test_pass_output_reporting(pytester: Pytester) -> None:
     )
 
 
-# ensemble: asserts the ` [100%]` progress column (only written from
-# `pytest_runtestloop`, which an ensemble does not run) and the
-# `test_color_yes.py:5:` crash lines, which are host-anchored.
+# ensemble: asserts the `test_color_yes.py:5:` crash lines, which for an
+# ensemble source are host-anchored. `module_from_path` would make them real,
+# but the imported module would not be assertion-rewritten and the
+# `E       assert 0` explanation would go with it.
 def test_color_yes(pytester: Pytester, color_mapping) -> None:
     p1 = pytester.makepyfile(
         """
@@ -2397,13 +2400,37 @@ def test_console_output_style_invalid(pytester: Pytester) -> None:
     )
 
 
-# ensemble: every test below asserts on the progress column (` [ 50%]`,
-# ` [10/20]`, a duration). The reporter only shows it when capturing is
-# active - process-global state an ensemble does not install - and the
-# final `[100%]` is written from a `pytest_runtestloop` wrapper, which an
-# ensemble never runs. `test_zero_tests_collected` is left for the same
-# reason: with the progress column off, the division it guards never happens.
 class TestProgressOutputStyle:
+    @pytest.fixture
+    def many_tests_sources(self) -> tuple[ModuleType, ...]:
+        @pytest.mark.parametrize("i", range(10))
+        def test_bar(i):
+            pass
+
+        @pytest.mark.parametrize("i", range(5))
+        def test_foo(i):
+            pass
+
+        @pytest.mark.parametrize("i", range(5))
+        def test_foobar(i):
+            pass
+
+        return (
+            build_module("test_bar", test_bar),
+            build_module("test_foo", test_foo),
+            build_module("test_foobar", test_foobar),
+        )
+
+    @staticmethod
+    def _run(
+        tmp_path: Path,
+        sources: tuple[ModuleType, ...],
+        *args: str,
+        inicfg: dict[str, object] | None = None,
+    ) -> RunRecord:
+        spec = ConfigSpec(rootpath=tmp_path, args=args, inicfg=inicfg or {})
+        return run_tests(*sources, spec=spec, capture_output=True)
+
     @pytest.fixture
     def many_tests_files(self, pytester: Pytester) -> None:
         pytester.makepyfile(
@@ -2439,65 +2466,71 @@ class TestProgressOutputStyle:
             """,
         )
 
-    def test_zero_tests_collected(self, pytester: Pytester) -> None:
+    def test_zero_tests_collected(self, tmp_path: Path) -> None:
         """Some plugins (testmon for example) might issue pytest_runtest_logreport without any tests being
         actually collected (#2971)."""
-        pytester.makeconftest(
-            """
-        def pytest_collection_modifyitems(items, config):
-            from _pytest.runner import CollectReport
-            for node_id in ('nodeid1', 'nodeid2'):
-                rep = CollectReport(node_id, 'passed', None, None)
-                rep.when = 'passed'
-                rep.duration = 0.1
-                config.hook.pytest_runtest_logreport(report=rep)
-        """
-        )
-        output = pytester.runpytest()
-        output.stdout.no_fnmatch_line("*ZeroDivisionError*")
-        output.stdout.fnmatch_lines(["=* 2 passed in *="])
 
-    def test_normal(self, many_tests_files, pytester: Pytester) -> None:
-        output = pytester.runpytest()
-        output.stdout.re_match_lines(
+        class LogReportsWithoutItems:
+            def pytest_collection_modifyitems(self, items, config):
+                for node_id in ("nodeid1", "nodeid2"):
+                    rep = CollectReport(node_id, "passed", None, None)
+                    rep.when = "passed"
+                    rep.duration = 0.1  # type: ignore[attr-defined]
+                    config.hook.pytest_runtest_logreport(report=rep)
+
+        record = run_tests(
+            spec=ConfigSpec(
+                rootpath=tmp_path, extra_plugins=(LogReportsWithoutItems(),)
+            ),
+            capture_output=True,
+        )
+        record.stdout.no_fnmatch_line("*ZeroDivisionError*")
+        record.stdout.fnmatch_lines(["=* 2 passed in *="])
+
+    def test_normal(self, tmp_path: Path, many_tests_sources) -> None:
+        record = self._run(tmp_path, many_tests_sources)
+        record.stdout.re_match_lines(
             [
                 r"test_bar.py \.{10} \s+ \[ 50%\]",
                 r"test_foo.py \.{5} \s+ \[ 75%\]",
                 r"test_foobar.py \.{5} \s+ \[100%\]",
             ]
         )
+        record.assert_outcomes(passed=20)
 
-    def test_colored_progress(
-        self, pytester: Pytester, monkeypatch, color_mapping
-    ) -> None:
+    def test_colored_progress(self, tmp_path: Path, monkeypatch, color_mapping) -> None:
         monkeypatch.setenv("PY_COLORS", "1")
-        pytester.makepyfile(
-            test_axfail="""
-                import pytest
-                @pytest.mark.xfail
-                def test_axfail(): assert 0
-            """,
-            test_bar="""
-                import pytest
-                @pytest.mark.parametrize('i', range(10))
-                def test_bar(i): pass
-            """,
-            test_foo="""
-                import pytest
-                import warnings
-                @pytest.mark.parametrize('i', range(5))
-                def test_foo(i):
-                    warnings.warn(DeprecationWarning("collection"))
-                    pass
-            """,
-            test_foobar="""
-                import pytest
-                @pytest.mark.parametrize('i', range(5))
-                def test_foobar(i): raise ValueError()
-            """,
+
+        @pytest.mark.xfail
+        def test_axfail():
+            assert 0
+
+        @pytest.mark.parametrize("i", range(10))
+        def test_bar(i):
+            pass
+
+        @pytest.mark.parametrize("i", range(5))
+        def test_foo(i):
+            import warnings
+
+            warnings.warn(DeprecationWarning("collection"))
+
+        @pytest.mark.parametrize("i", range(5))
+        def test_foobar(i):
+            raise ValueError
+
+        axfail_module = build_module("test_axfail", test_axfail)
+        sources = (
+            axfail_module,
+            build_module("test_bar", test_bar),
+            build_module("test_foo", test_foo),
+            build_module("test_foobar", test_foobar),
         )
-        result = pytester.runpytest()
-        result.stdout.re_match_lines(
+        # The host suite turns warnings into errors; the point here is the
+        # yellow progress indicator a *recorded* warning produces.
+        inicfg: dict[str, object] = {"filterwarnings": ["always"]}
+        record = self._run(tmp_path, sources, inicfg=inicfg)
+        record.stdout.re_match_lines(
             color_mapping.format_for_rematch(
                 [
                     r"test_axfail.py {yellow}x{reset}{green} \s+ \[  4%\]{reset}",
@@ -2507,10 +2540,11 @@ class TestProgressOutputStyle:
                 ]
             )
         )
+        record.assert_outcomes(passed=15, failed=5, xfailed=1, warnings=5)
 
         # Only xfail should have yellow progress indicator.
-        result = pytester.runpytest("test_axfail.py")
-        result.stdout.re_match_lines(
+        record = self._run(tmp_path, (axfail_module,))
+        record.stdout.re_match_lines(
             color_mapping.format_for_rematch(
                 [
                     r"test_axfail.py {yellow}x{reset}{yellow} \s+ \[100%\]{reset}",
@@ -2518,23 +2552,25 @@ class TestProgressOutputStyle:
                 ]
             )
         )
+        record.assert_outcomes(xfailed=1)
 
-    def test_count(self, many_tests_files, pytester: Pytester) -> None:
-        pytester.makeini(
-            """
-            [pytest]
-            console_output_style = count
-        """
+    def test_count(self, tmp_path: Path, many_tests_sources) -> None:
+        record = self._run(
+            tmp_path, many_tests_sources, inicfg={"console_output_style": "count"}
         )
-        output = pytester.runpytest()
-        output.stdout.re_match_lines(
+        record.stdout.re_match_lines(
             [
                 r"test_bar.py \.{10} \s+ \[10/20\]",
                 r"test_foo.py \.{5} \s+ \[15/20\]",
                 r"test_foobar.py \.{5} \s+ \[20/20\]",
             ]
         )
+        record.assert_outcomes(passed=20)
 
+    # ensemble: `console_output_style=times` groups reports by
+    # ``report.location[0]``, which for a synthesized ensemble module is the
+    # *host* file - every item then looks like it belongs to one giant module
+    # and only the very last line gets a duration. See test_times_none_collected.
     def test_times(self, many_tests_files, pytester: Pytester) -> None:
         pytester.makeini(
             """
@@ -2551,6 +2587,7 @@ class TestProgressOutputStyle:
             ]
         )
 
+    # ensemble: see test_times.
     def test_times_multiline(
         self, more_tests_files, monkeypatch, pytester: Pytester
     ) -> None:
@@ -2571,6 +2608,8 @@ class TestProgressOutputStyle:
             consecutive=True,
         )
 
+    # ensemble: asserts the NO_TESTS_COLLECTED exit code, which comes from
+    # `wrap_session`; an ensemble has no session wrapper and no exit code.
     def test_times_none_collected(self, pytester: Pytester) -> None:
         pytester.makeini(
             """
@@ -2581,32 +2620,31 @@ class TestProgressOutputStyle:
         output = pytester.runpytest()
         assert output.ret == ExitCode.NO_TESTS_COLLECTED
 
-    def test_verbose(self, many_tests_files, pytester: Pytester) -> None:
-        output = pytester.runpytest("-v")
-        output.stdout.re_match_lines(
+    def test_verbose(self, tmp_path: Path, many_tests_sources) -> None:
+        record = self._run(tmp_path, many_tests_sources, "-v")
+        record.stdout.re_match_lines(
             [
                 r"test_bar.py::test_bar\[0\] PASSED \s+ \[  5%\]",
                 r"test_foo.py::test_foo\[4\] PASSED \s+ \[ 75%\]",
                 r"test_foobar.py::test_foobar\[4\] PASSED \s+ \[100%\]",
             ]
         )
+        record.assert_outcomes(passed=20)
 
-    def test_verbose_count(self, many_tests_files, pytester: Pytester) -> None:
-        pytester.makeini(
-            """
-            [pytest]
-            console_output_style = count
-        """
+    def test_verbose_count(self, tmp_path: Path, many_tests_sources) -> None:
+        record = self._run(
+            tmp_path, many_tests_sources, "-v", inicfg={"console_output_style": "count"}
         )
-        output = pytester.runpytest("-v")
-        output.stdout.re_match_lines(
+        record.stdout.re_match_lines(
             [
                 r"test_bar.py::test_bar\[0\] PASSED \s+ \[ 1/20\]",
                 r"test_foo.py::test_foo\[4\] PASSED \s+ \[15/20\]",
                 r"test_foobar.py::test_foobar\[4\] PASSED \s+ \[20/20\]",
             ]
         )
+        record.assert_outcomes(passed=20)
 
+    # ensemble: see test_times.
     def test_verbose_times(self, many_tests_files, pytester: Pytester) -> None:
         pytester.makeini(
             """
@@ -2623,6 +2661,8 @@ class TestProgressOutputStyle:
             ]
         )
 
+    # ensemble: the four xdist tests below run the tests through xdist
+    # workers, i.e. subprocesses.
     def test_xdist_normal(
         self, many_tests_files, pytester: Pytester, monkeypatch
     ) -> None:
@@ -2695,6 +2735,10 @@ class TestProgressOutputStyle:
             ]
         )
 
+    # ensemble: the point is that `--capture=no` suppresses the progress
+    # column. An ensemble reporter writes to its own private stream, which
+    # counts as captured no matter what `--capture` says, so the column stays
+    # on and the `no_fnmatch_line("*%]*")` half could never hold.
     def test_capture_no(self, many_tests_files, pytester: Pytester) -> None:
         output = pytester.runpytest("-s")
         output.stdout.re_match_lines(
@@ -2704,6 +2748,10 @@ class TestProgressOutputStyle:
         output = pytester.runpytest("--capture=no")
         output.stdout.no_fnmatch_line("*%]*")
 
+    # ensemble: the ini value under test only does anything when
+    # `--capture=no` would otherwise suppress the column; in an ensemble the
+    # column is on regardless, so this would assert nothing. See
+    # test_capture_no.
     def test_capture_no_progress_enabled(
         self, many_tests_files, pytester: Pytester
     ) -> None:
@@ -2723,10 +2771,35 @@ class TestProgressOutputStyle:
         )
 
 
-# ensemble: every test below asserts on the progress column; see
-# TestProgressOutputStyle.
 class TestProgressWithTeardown:
     """Ensure we show the correct percentages for tests that fail during teardown (#3088)"""
+
+    @pytest.fixture
+    def teardown_fixture_plugin(self) -> object:
+        """The ensemble equivalent of a conftest at the rootdir."""
+
+        class TeardownFixturePlugin:
+            @pytest.fixture
+            def fail_teardown(self):
+                yield
+                assert False
+
+        return TeardownFixturePlugin()
+
+    @pytest.fixture
+    def many_sources(self) -> tuple[ModuleType, ...]:
+        @pytest.mark.parametrize("i", range(5))
+        def test_bar(fail_teardown, i):
+            pass
+
+        @pytest.mark.parametrize("i", range(15))
+        def test_foo(fail_teardown, i):
+            pass
+
+        return (
+            build_module("test_bar", test_bar),
+            build_module("test_foo", test_foo),
+        )
 
     @pytest.fixture
     def contest_with_teardown_fixture(self, pytester: Pytester) -> None:
@@ -2758,47 +2831,75 @@ class TestProgressWithTeardown:
             """,
         )
 
-    def test_teardown_simple(
-        self, pytester: Pytester, contest_with_teardown_fixture
-    ) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo(fail_teardown):
-                pass
-        """
+    def test_teardown_simple(self, tmp_path: Path, teardown_fixture_plugin) -> None:
+        def test_foo(fail_teardown):
+            pass
+
+        record = run_tests(
+            test_foo,
+            spec=ConfigSpec(
+                rootpath=tmp_path, extra_plugins=(teardown_fixture_plugin,)
+            ),
+            name="test_teardown_simple",
+            capture_output=True,
         )
-        output = pytester.runpytest()
-        output.stdout.re_match_lines([r"test_teardown_simple.py \.E\s+\[100%\]"])
+        record.stdout.re_match_lines([r"test_teardown_simple.py \.E\s+\[100%\]"])
+        # `assertoutcome`-style categories: the teardown failure is an error.
+        record.assert_outcomes(passed=1, errors=1)
 
     def test_teardown_with_test_also_failing(
-        self, pytester: Pytester, contest_with_teardown_fixture
+        self, tmp_path: Path, teardown_fixture_plugin
     ) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo(fail_teardown):
-                assert 0
-        """
+        def test_foo(fail_teardown):
+            assert 0
+
+        record = run_tests(
+            test_foo,
+            spec=ConfigSpec(
+                rootpath=tmp_path,
+                args=("-rfE",),
+                extra_plugins=(teardown_fixture_plugin,),
+            ),
+            name="test_teardown_with_test_also_failing",
+            capture_output=True,
         )
-        output = pytester.runpytest("-rfE")
-        output.stdout.re_match_lines(
+        record.stdout.re_match_lines(
             [
                 r"test_teardown_with_test_also_failing.py FE\s+\[100%\]",
                 "FAILED test_teardown_with_test_also_failing.py::test_foo - assert 0",
                 "ERROR test_teardown_with_test_also_failing.py::test_foo - assert False",
             ]
         )
+        record.assert_outcomes(failed=1, errors=1)
 
-    def test_teardown_many(self, pytester: Pytester, many_files) -> None:
-        output = pytester.runpytest()
-        output.stdout.re_match_lines(
+    def test_teardown_many(
+        self, tmp_path: Path, many_sources, teardown_fixture_plugin
+    ) -> None:
+        record = run_tests(
+            *many_sources,
+            spec=ConfigSpec(
+                rootpath=tmp_path, extra_plugins=(teardown_fixture_plugin,)
+            ),
+            capture_output=True,
+        )
+        record.stdout.re_match_lines(
             [r"test_bar.py (\.E){5}\s+\[ 25%\]", r"test_foo.py (\.E){15}\s+\[100%\]"]
         )
+        record.assert_outcomes(passed=20, errors=20)
 
     def test_teardown_many_verbose(
-        self, pytester: Pytester, many_files, color_mapping
+        self, tmp_path: Path, many_sources, teardown_fixture_plugin, color_mapping
     ) -> None:
-        result = pytester.runpytest("-v")
-        result.stdout.fnmatch_lines(
+        record = run_tests(
+            *many_sources,
+            spec=ConfigSpec(
+                rootpath=tmp_path,
+                args=("-v",),
+                extra_plugins=(teardown_fixture_plugin,),
+            ),
+            capture_output=True,
+        )
+        record.stdout.fnmatch_lines(
             color_mapping.format_for_fnmatch(
                 [
                     "test_bar.py::test_bar[0] PASSED  * [  5%]",
@@ -2810,7 +2911,9 @@ class TestProgressWithTeardown:
                 ]
             )
         )
+        record.assert_outcomes(passed=20, errors=20)
 
+    # ensemble: runs the tests through xdist workers, i.e. subprocesses.
     def test_xdist_normal(self, many_files, pytester: Pytester, monkeypatch) -> None:
         pytest.importorskip("xdist")
         monkeypatch.delenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", raising=False)
@@ -3329,10 +3432,6 @@ def test_no_warning_on_terminal_with_a_single_config_file(
     )
 
 
-# ensemble: every test below matches whole blocks of consecutive lines whose
-# exact column layout is the point - the trailing ` [100%]` progress column
-# (never rendered by an ensemble, see TestProgressOutputStyle) is part of that
-# layout, and half of them assert on `--collect-only` rendering.
 class TestFineGrainedTestCase:
     DEFAULT_FILE_CONTENTS = """
             import pytest
@@ -3358,127 +3457,181 @@ class TestFineGrainedTestCase:
                 pass
             """
 
-    @pytest.mark.parametrize("verbosity", [1, 2])
-    def test_execute_positive(self, verbosity, pytester: Pytester) -> None:
-        # expected: one test case per line (with file name), word describing result
-        p = TestFineGrainedTestCase._initialize_files(pytester, verbosity=verbosity)
-        result = pytester.runpytest(p)
+    @staticmethod
+    def _default_module(name: str) -> ModuleType:
+        """The in-memory equivalent of DEFAULT_FILE_CONTENTS."""
 
-        result.stdout.fnmatch_lines(
+        @pytest.mark.parametrize("i", range(4))
+        def test_ok(i):
+            """
+            some docstring
+            """  # noqa: D200, D403
+
+        def test_fail():
+            assert False
+
+        return build_module(name, test_ok, test_fail)
+
+    @staticmethod
+    def _long_skip_module(name: str) -> ModuleType:
+        """The in-memory equivalent of LONG_SKIP_FILE_CONTENTS."""
+
+        @pytest.mark.skip(
+            "some long skip reason that will not fit on a single line with other content that goes"
+            " on and on and on and on and on"
+        )
+        def test_skip():
+            pass
+
+        return build_module(name, test_skip)
+
+    @staticmethod
+    def _run(
+        module: ModuleType, tmp_path: Path, verbosity: int, *args: str
+    ) -> RunRecord:
+        """Run *module* with ``verbosity_test_cases`` set, capturing output."""
+        spec = ConfigSpec(
+            rootpath=tmp_path,
+            args=args,
+            inicfg={"verbosity_test_cases": str(verbosity)},
+        )
+        return run_tests(module, spec=spec, capture_output=True)
+
+    @pytest.mark.parametrize("verbosity", [1, 2])
+    def test_execute_positive(
+        self, verbosity, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
+        # expected: one test case per line (with file name), word describing result
+        # The column layout is the point, so the width must not be the host's.
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_positive.py"
+        record = self._run(self._default_module(name[:-3]), tmp_path, verbosity)
+
+        record.stdout.fnmatch_lines(
             [
                 "collected 5 items",
                 "",
-                f"{p.name}::test_ok[0] PASSED                              [ 20%]",
-                f"{p.name}::test_ok[1] PASSED                              [ 40%]",
-                f"{p.name}::test_ok[2] PASSED                              [ 60%]",
-                f"{p.name}::test_ok[3] PASSED                              [ 80%]",
-                f"{p.name}::test_fail FAILED                               [100%]",
+                f"{name}::test_ok[0] PASSED                              [ 20%]",
+                f"{name}::test_ok[1] PASSED                              [ 40%]",
+                f"{name}::test_ok[2] PASSED                              [ 60%]",
+                f"{name}::test_ok[3] PASSED                              [ 80%]",
+                f"{name}::test_fail FAILED                               [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(passed=4, failed=1)
 
-    def test_execute_0_global_1(self, pytester: Pytester) -> None:
+    def test_execute_0_global_1(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
         # expected: one file name per line, single character describing result
-        p = TestFineGrainedTestCase._initialize_files(pytester, verbosity=0)
-        result = pytester.runpytest("-v", p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_0_global_1.py"
+        record = self._run(self._default_module(name[:-3]), tmp_path, 0, "-v")
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collecting ... collected 5 items",
                 "",
-                f"{p.name} ....F                                         [100%]",
+                f"{name} ....F                                         [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(passed=4, failed=1)
 
     @pytest.mark.parametrize("verbosity", [-1, -2])
-    def test_execute_negative(self, verbosity, pytester: Pytester) -> None:
+    def test_execute_negative(
+        self, verbosity, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         # expected: single character describing result
-        p = TestFineGrainedTestCase._initialize_files(pytester, verbosity=verbosity)
-        result = pytester.runpytest(p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_negative.py"
+        record = self._run(self._default_module(name[:-3]), tmp_path, verbosity)
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 5 items",
                 "....F                                                                    [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(passed=4, failed=1)
 
-    def test_execute_skipped_positive_2(self, pytester: Pytester) -> None:
+    def test_execute_skipped_positive_2(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         # expected: one test case per line (with file name), word describing result, full reason
-        p = TestFineGrainedTestCase._initialize_files(
-            pytester,
-            verbosity=2,
-            file_contents=TestFineGrainedTestCase.LONG_SKIP_FILE_CONTENTS,
-        )
-        result = pytester.runpytest(p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_skipped_positive_2.py"
+        record = self._run(self._long_skip_module(name[:-3]), tmp_path, 2)
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 1 item",
                 "",
-                f"{p.name}::test_skip SKIPPED (some long skip",
+                f"{name}::test_skip SKIPPED (some long skip",
                 "reason that will not fit on a single line with other content that goes",
                 "on and on and on and on and on)                                          [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(skipped=1)
 
-    def test_execute_skipped_positive_1(self, pytester: Pytester) -> None:
+    def test_execute_skipped_positive_1(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         # expected: one test case per line (with file name), word describing result, reason truncated
-        p = TestFineGrainedTestCase._initialize_files(
-            pytester,
-            verbosity=1,
-            file_contents=TestFineGrainedTestCase.LONG_SKIP_FILE_CONTENTS,
-        )
-        result = pytester.runpytest(p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_skipped_positive_1.py"
+        record = self._run(self._long_skip_module(name[:-3]), tmp_path, 1)
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 1 item",
                 "",
-                f"{p.name}::test_skip SKIPPED (some long ski...) [100%]",
+                f"{name}::test_skip SKIPPED (some long ski...) [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(skipped=1)
 
-    def test_execute_skipped__0_global_1(self, pytester: Pytester) -> None:
+    def test_execute_skipped__0_global_1(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         # expected: one file name per line, single character describing result (no reason)
-        p = TestFineGrainedTestCase._initialize_files(
-            pytester,
-            verbosity=0,
-            file_contents=TestFineGrainedTestCase.LONG_SKIP_FILE_CONTENTS,
-        )
-        result = pytester.runpytest("-v", p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_skipped__0_global_1.py"
+        record = self._run(self._long_skip_module(name[:-3]), tmp_path, 0, "-v")
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collecting ... collected 1 item",
                 "",
-                f"{p.name} s                                    [100%]",
+                f"{name} s                                    [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(skipped=1)
 
     @pytest.mark.parametrize("verbosity", [-1, -2])
-    def test_execute_skipped_negative(self, verbosity, pytester: Pytester) -> None:
+    def test_execute_skipped_negative(
+        self, verbosity, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         # expected: single character describing result (no reason)
-        p = TestFineGrainedTestCase._initialize_files(
-            pytester,
-            verbosity=verbosity,
-            file_contents=TestFineGrainedTestCase.LONG_SKIP_FILE_CONTENTS,
-        )
-        result = pytester.runpytest(p)
+        monkeypatch.setenv("COLUMNS", "80")
+        name = "test_execute_skipped_negative.py"
+        record = self._run(self._long_skip_module(name[:-3]), tmp_path, verbosity)
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "collected 1 item",
                 "s                                                                        [100%]",
             ],
             consecutive=True,
         )
+        record.assert_outcomes(skipped=1)
 
+    # ensemble: every test below asserts on `--collect-only` rendering, which
+    # is served from `pytest_cmdline_main`; an ensemble runs neither that hook
+    # nor the `<Dir ...>` node the rendering starts from.
     @pytest.mark.parametrize("verbosity", [1, 2])
     def test__collect_only_positive(self, verbosity, pytester: Pytester) -> None:
         p = TestFineGrainedTestCase._initialize_files(pytester, verbosity=verbosity)
