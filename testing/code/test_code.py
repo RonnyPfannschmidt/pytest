@@ -1,9 +1,13 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import ast
+import linecache
+from pathlib import Path
 import re
 import sys
 from types import FrameType
+from typing import Any
 from unittest import mock
 
 from _pytest._code import Code
@@ -225,3 +229,86 @@ def test_ExceptionChainRepr():
     assert isinstance(repr1, ExceptionChainRepr)
     assert hash(repr1) != hash(repr2)
     assert repr1 is not excinfo1.getrepr()
+
+
+class TestGetSourceNarrowing:
+    """``TracebackEntry.getsource`` parses the enclosing block, not the file.
+
+    Locating the failing statement means parsing source into an AST. Doing
+    that for the whole file costs O(file) per rendered traceback entry, which
+    is why the block is parsed instead -- with a fallback for the frames whose
+    block cannot be determined or does not contain the reported line.
+    """
+
+    def test_function_frame_parses_only_the_block(self) -> None:
+        astcache: dict[tuple[str | Path, int], ast.AST] = {}
+        excinfo = pytest.raises(ValueError, self._boom)
+        entry = excinfo.traceback[-1]
+        source = entry.getsource(astcache)
+        assert source is not None
+        assert str(source).endswith('raise ValueError("boom")')
+
+        # The cached tree is the method, not this whole file.
+        (cached,) = astcache.values()
+        assert isinstance(cached, ast.Module)
+        (node,) = cached.body
+        assert isinstance(node, ast.FunctionDef)
+        assert node.name == "_boom"
+
+    def _boom(self) -> None:
+        raise ValueError("boom")
+
+    def test_module_frame_parses_the_whole_file(self) -> None:
+        """A module frame has no enclosing block, so it parses the whole file.
+
+        ``getblock`` walks an indented suite only for def/class/decorated
+        code; for anything else it stops at the first logical line, which is
+        never the whole module.
+        """
+        astcache: dict[tuple[str | Path, int], ast.AST] = {}
+        filename = "<pytest-narrow-module>"
+        lines = ["if 1:\n", "    raise ValueError('boom')\n", "x = 2\n"]
+        code = compile("".join(lines), filename, "exec")
+        with mock.patch.dict(linecache.cache, {filename: (1, None, lines, filename)}):
+            excinfo = pytest.raises(ValueError, exec, code, {})
+            entry = excinfo.traceback[-1]
+            assert entry.frame.code.raw.co_name == "<module>"
+            source = entry.getsource(astcache)
+        assert source is not None
+        assert str(source) == "if 1:\n    raise ValueError('boom')"
+
+        # The whole file, so the statement after the block is in the tree.
+        (cached,) = astcache.values()
+        assert isinstance(cached, ast.Module)
+        assert len(cached.body) == 2
+
+    def test_line_outside_the_block_falls_back(self) -> None:
+        """The block can fall short of the frame -- exec'd or generated code,
+        a decorator returning a differently shaped callable."""
+        filename = "<pytest-narrow-short>"
+        # What linecache reports disagrees with what was compiled: the block
+        # starting at line 1 is a single line, but the frame reports line 3.
+        shown = ["def g(): pass\n", "x = 1\n", "y = 2\n"]
+        code = compile(
+            "def g():\n    x = 1\n    raise ValueError('boom')\n", filename, "exec"
+        )
+        ns: dict[str, Any] = {}
+        exec(code, ns)
+        with mock.patch.dict(linecache.cache, {filename: (1, None, shown, filename)}):
+            excinfo = pytest.raises(ValueError, ns["g"])
+            source = excinfo.traceback[-1].getsource()
+        assert source is not None
+        # Narrowing would have cut the file off after line 1.
+        assert "y = 2" in str(source)
+
+    def test_unparseable_block_falls_back(self) -> None:
+        """``inspect.getblock`` tokenizes, and tokenizing can fail."""
+        filename = "<pytest-narrow-broken>"
+        shown = ["def g():\n", '    """\n']
+        code = compile("def g():\n    raise ValueError('boom')\n", filename, "exec")
+        ns: dict[str, Any] = {}
+        exec(code, ns)
+        with mock.patch.dict(linecache.cache, {filename: (1, None, shown, filename)}):
+            excinfo = pytest.raises(ValueError, ns["g"])
+            source = excinfo.traceback[-1].getsource()
+        assert source is not None

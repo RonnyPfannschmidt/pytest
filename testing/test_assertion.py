@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import MutableSequence
 import dataclasses
+from pathlib import Path
 import sys
 import textwrap
 from typing import Any
@@ -25,9 +26,29 @@ from _pytest.assertion._typing import TruncationBudget
 from _pytest.assertion.compare_text import _compare_eq_text
 from _pytest.assertion.compare_text import _notin_text
 from _pytest.config import Config as _Config
+from _pytest.config import UsageError
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import run_tests
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.pytester import Pytester
 import pytest
+
+
+def assertion_spec(rootpath: Path, *args: str, **inicfg: str) -> ConfigSpec:
+    """A nested config that renders assertion explanations like a real run.
+
+    The ``assertion`` plugin is not among the ensemble defaults, and without
+    it ``util._reprcompare`` stays bound to whatever the *host* run installed:
+    an explanation is still produced (the sources in this file are rewritten
+    by the host at import time), but its verbosity, its ini settings and the
+    ``pytest_assertrepr_compare`` implementations consulted are the host's,
+    not the ensemble's. Loading the plugin is safe here because the rewrite
+    import hook is installed from ``Config._preparse``, which an ensemble
+    never runs.
+    """
+    return ConfigSpec(rootpath=rootpath, args=args, inicfg=inicfg).with_plugins(
+        "assertion"
+    )
 
 
 def mock_config(
@@ -124,6 +145,10 @@ class TestMockConfig:
             config.getini("--- NOT AN INI ---")
 
 
+# ensemble: every test in this class is about the assertion *rewriting* of
+# files on import - conftests, plugin modules, installed distributions - which
+# an ensemble cannot reproduce: its sources are objects the host already
+# rewrote, and it never installs an import hook of its own.
 class TestImportHookInstallation:
     @pytest.mark.parametrize("initial_conftest", [True, False])
     @pytest.mark.parametrize("mode", ["plain", "rewrite"])
@@ -427,29 +452,34 @@ class TestImportHookInstallation:
 
 
 class TestBinReprIntegration:
-    def test_pytest_assertrepr_compare_called(self, pytester: Pytester) -> None:
-        pytester.makeconftest(
-            """
-            import pytest
-            values = []
-            def pytest_assertrepr_compare(op, left, right):
+    def test_pytest_assertrepr_compare_called(self, tmp_path: Path) -> None:
+        values: list[tuple[str, object, object]] = []
+
+        class Conftest:
+            def pytest_assertrepr_compare(self, op, left, right):
                 values.append((op, left, right))
 
-            @pytest.fixture
-            def list(request):
+            @pytest.fixture(name="list")
+            def list_fixture(self, request):
                 return values
-        """
+
+        def test_hello():
+            assert 0 == 1  # type: ignore[comparison-overlap]
+
+        def test_check(list):
+            assert list == [("==", 0, 1)]
+
+        record = run_tests(
+            test_hello,
+            test_check,
+            spec=assertion_spec(tmp_path).with_plugins(Conftest()),
         )
-        pytester.makepyfile(
-            """
-            def test_hello():
-                assert 0 == 1
-            def test_check(list):
-                assert list == [("==", 0, 1)]
-        """
-        )
-        result = pytester.runpytest("-v")
-        result.stdout.fnmatch_lines(["*test_hello*FAIL*", "*test_check*PASS*"])
+        # The "-v" lines the original matched only carried the two outcomes;
+        # assert them as reports, plus what the hook actually saw.
+        record.assert_outcomes(failed=1, passed=1)
+        assert record["test_hello"].failed
+        assert record["test_check"].passed
+        assert values == [("==", 0, 1)]
 
 
 def callop(
@@ -760,30 +790,29 @@ class TestAssert_reprcompare:
         ]
 
     def test_iterable_full_diff_ci(
-        self, monkeypatch: MonkeyPatch, pytester: Pytester
+        self, monkeypatch: MonkeyPatch, tmp_path: Path
     ) -> None:
-        pytester.makepyfile(
-            r"""
-            def test_full_diff():
-                left = [0, 1]
-                right = [0, 2]
-                assert left == right
-        """
-        )
+        def test_full_diff():
+            left = [0, 1]
+            right = [0, 2]
+            assert left == right
+
+        def run():
+            return run_tests(
+                test_full_diff, spec=assertion_spec(tmp_path), capture_output=True
+            )
+
         monkeypatch.setenv("CI", "true")
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        run().stdout.fnmatch_lines(
             ["E         Full diff: (-: missing in left side, +: extra in left side)"]
         )
 
         # Setting CI to empty string is same as having it undefined
         monkeypatch.setenv("CI", "")
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["E         Use -v to get more diff"])
+        run().stdout.fnmatch_lines(["E         Use -v to get more diff"])
 
         monkeypatch.delenv("CI", raising=False)
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["E         Use -v to get more diff"])
+        run().stdout.fnmatch_lines(["E         Use -v to get more diff"])
 
     def test_list_different_lengths(self) -> None:
         expl = callequal([0, 1], [0, 1, 2])
@@ -1239,12 +1268,55 @@ class TestAssert_reprcompare:
         ]
 
 
+# Mirrors ``example_scripts/dataclasses/test_compare_recursive_dataclasses.py``.
+# These live at module level rather than inside the test because the expected
+# output contains their reprs, and a dataclass repr is built from
+# ``__qualname__`` - a class nested in a test function would render as
+# ``TestX.test_y.<locals>.S(...)``.
+@dataclasses.dataclass
+class S:
+    a: int
+    b: str
+
+
+@dataclasses.dataclass
+class C:
+    c: S
+    d: S
+
+
+@dataclasses.dataclass
+class C2:
+    e: C
+    f: S
+
+
+@dataclasses.dataclass
+class C3:
+    g: S
+    h: C2
+    i: str
+    j: str
+
+
 class TestAssert_reprcompare_dataclass:
-    def test_dataclasses(self, pytester: Pytester) -> None:
-        p = pytester.copy_example("dataclasses/test_compare_dataclasses.py")
-        result = pytester.runpytest(p)
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.fnmatch_lines(
+    def test_dataclasses(self, tmp_path: Path) -> None:
+        def test_dataclasses() -> None:
+            @dataclasses.dataclass
+            class SimpleDataObject:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field()
+
+            left = SimpleDataObject(1, "b")
+            right = SimpleDataObject(1, "c")
+
+            assert left == right
+
+        record = run_tests(
+            test_dataclasses, spec=assertion_spec(tmp_path), capture_output=True
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.fnmatch_lines(
             [
                 "E         Omitting 1 identical items, use -vv to show",
                 "E         Differing attributes:",
@@ -1258,11 +1330,30 @@ class TestAssert_reprcompare_dataclass:
             consecutive=True,
         )
 
-    def test_recursive_dataclasses(self, pytester: Pytester) -> None:
-        p = pytester.copy_example("dataclasses/test_compare_recursive_dataclasses.py")
-        result = pytester.runpytest(p)
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.fnmatch_lines(
+    def test_recursive_dataclasses(self, tmp_path: Path) -> None:
+        def test_recursive_dataclasses():
+            left = C3(
+                S(10, "ten"),
+                C2(C(S(1, "one"), S(2, "two")), S(2, "three")),
+                "equal",
+                "left",
+            )
+            right = C3(
+                S(20, "xxx"),
+                C2(C(S(1, "one"), S(2, "yyy")), S(3, "three")),
+                "equal",
+                "right",
+            )
+
+            assert left == right
+
+        record = run_tests(
+            test_recursive_dataclasses,
+            spec=assertion_spec(tmp_path),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.fnmatch_lines(
             [
                 "E         Omitting 1 identical items, use -vv to show",
                 "E         Differing attributes:",
@@ -1276,11 +1367,30 @@ class TestAssert_reprcompare_dataclass:
             consecutive=True,
         )
 
-    def test_recursive_dataclasses_verbose(self, pytester: Pytester) -> None:
-        p = pytester.copy_example("dataclasses/test_compare_recursive_dataclasses.py")
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.fnmatch_lines(
+    def test_recursive_dataclasses_verbose(self, tmp_path: Path) -> None:
+        def test_recursive_dataclasses():
+            left = C3(
+                S(10, "ten"),
+                C2(C(S(1, "one"), S(2, "two")), S(2, "three")),
+                "equal",
+                "left",
+            )
+            right = C3(
+                S(20, "xxx"),
+                C2(C(S(1, "one"), S(2, "yyy")), S(3, "three")),
+                "equal",
+                "right",
+            )
+
+            assert left == right
+
+        record = run_tests(
+            test_recursive_dataclasses,
+            spec=assertion_spec(tmp_path, "-vv"),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.fnmatch_lines(
             [
                 "E         Matching attributes:",
                 "E         ['i']",
@@ -1306,11 +1416,25 @@ class TestAssert_reprcompare_dataclass:
             consecutive=True,
         )
 
-    def test_dataclasses_verbose(self, pytester: Pytester) -> None:
-        p = pytester.copy_example("dataclasses/test_compare_dataclasses_verbose.py")
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.fnmatch_lines(
+    def test_dataclasses_verbose(self, tmp_path: Path) -> None:
+        def test_dataclasses_verbose() -> None:
+            @dataclasses.dataclass
+            class SimpleDataObject:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field()
+
+            left = SimpleDataObject(1, "b")
+            right = SimpleDataObject(1, "c")
+
+            assert left == right
+
+        record = run_tests(
+            test_dataclasses_verbose,
+            spec=assertion_spec(tmp_path, "-vv"),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.fnmatch_lines(
             [
                 "*Matching attributes:*",
                 "*['field_a']*",
@@ -1319,37 +1443,91 @@ class TestAssert_reprcompare_dataclass:
             ]
         )
 
-    def test_dataclasses_with_attribute_comparison_off(
-        self, pytester: Pytester
-    ) -> None:
-        p = pytester.copy_example(
-            "dataclasses/test_compare_dataclasses_field_comparison_off.py"
-        )
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=0, passed=1)
+    def test_dataclasses_with_attribute_comparison_off(self, tmp_path: Path) -> None:
+        def test_dataclasses_with_attribute_comparison_off() -> None:
+            @dataclasses.dataclass
+            class SimpleDataObject:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field(compare=False)
 
-    def test_comparing_two_different_data_classes(self, pytester: Pytester) -> None:
-        p = pytester.copy_example(
-            "dataclasses/test_compare_two_different_dataclasses.py"
-        )
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=0, passed=1)
+            left = SimpleDataObject(1, "b")
+            right = SimpleDataObject(1, "c")
 
-    def test_data_classes_with_custom_eq(self, pytester: Pytester) -> None:
-        p = pytester.copy_example(
-            "dataclasses/test_compare_dataclasses_with_custom_eq.py"
+            assert left == right
+
+        record = run_tests(
+            test_dataclasses_with_attribute_comparison_off,
+            spec=assertion_spec(tmp_path, "-vv"),
+            # "-vv" is a terminal plugin option, which capturing loads.
+            capture_output=True,
         )
+        record.assert_outcomes(failed=0, passed=1)
+
+    def test_comparing_two_different_data_classes(self, tmp_path: Path) -> None:
+        def test_comparing_two_different_data_classes() -> None:
+            @dataclasses.dataclass
+            class SimpleDataObjectOne:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field()
+
+            @dataclasses.dataclass
+            class SimpleDataObjectTwo:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field()
+
+            left = SimpleDataObjectOne(1, "b")
+            right = SimpleDataObjectTwo(1, "c")
+
+            assert left != right  # type: ignore[comparison-overlap]
+
+        record = run_tests(
+            test_comparing_two_different_data_classes,
+            spec=assertion_spec(tmp_path, "-vv"),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=0, passed=1)
+
+    def test_data_classes_with_custom_eq(self, tmp_path: Path) -> None:
+        def test_dataclasses() -> None:
+            @dataclasses.dataclass
+            class SimpleDataObject:
+                field_a: int = dataclasses.field()
+                field_b: str = dataclasses.field()
+
+                def __eq__(self, o: object, /) -> bool:
+                    return super().__eq__(o)
+
+            left = SimpleDataObject(1, "b")
+            right = SimpleDataObject(1, "c")
+
+            assert left == right
+
         # issue 9362
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.no_re_match_line(".*Differing attributes.*")
+        record = run_tests(
+            test_dataclasses,
+            spec=assertion_spec(tmp_path, "-vv"),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.no_re_match_line(".*Differing attributes.*")
 
-    def test_data_classes_with_initvar(self, pytester: Pytester) -> None:
-        p = pytester.copy_example("dataclasses/test_compare_initvar.py")
+    def test_data_classes_with_initvar(self, tmp_path: Path) -> None:
+        @dataclasses.dataclass
+        class Foo:
+            init_only: dataclasses.InitVar[int]
+            real_attr: int
+
+        def test_demonstrate():
+            assert Foo(1, 2) == Foo(1, 3)
+
         # issue 9820
-        result = pytester.runpytest(p, "-vv")
-        result.assert_outcomes(failed=1, passed=0)
-        result.stdout.no_re_match_line(".*AttributeError.*")
+        record = run_tests(
+            test_demonstrate,
+            spec=assertion_spec(tmp_path, "-vv"),
+            capture_output=True,
+        )
+        record.assert_outcomes(failed=1, passed=0)
+        record.stdout.no_re_match_line(".*AttributeError.*")
 
 
 class TestAssert_reprcompare_attrsclass:
@@ -1536,17 +1714,15 @@ class TestAssert_reprcompare_namedtuple:
 
 
 class TestFormatExplanation:
-    def test_special_chars_full(self, pytester: Pytester) -> None:
+    def test_special_chars_full(self, tmp_path: Path) -> None:
         # Issue 453, for the bug this would raise IndexError
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert '\\n}' == ''
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*AssertionError*"])
+        def test_foo():
+            assert "\n}" == ""  # type: ignore[comparison-overlap]
+
+        record = run_tests(test_foo, spec=assertion_spec(tmp_path), capture_output=True)
+        # ``ret == 1`` is TESTS_FAILED; assert the failure itself.
+        record.assert_outcomes(failed=1)
+        record.stdout.fnmatch_lines(["*AssertionError*"])
 
     def test_fmt_simple(self) -> None:
         expl = "assert foo"
@@ -1740,25 +1916,29 @@ class TestTruncateExplanation:
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
-    def test_full_output_truncated(self, monkeypatch, pytester: Pytester) -> None:
-        """Test against full runpytest() output."""
+    def test_full_output_truncated(self, monkeypatch, tmp_path: Path) -> None:
+        """Test against the full rendered ensemble output."""
         line_count = 7
         line_len = 100
-        pytester.makepyfile(
-            rf"""
-            def test_many_lines():
-                a = list([str(i)[0] * {line_len} for i in range({line_count})])
-                b = a[::2]
-                a = '\n'.join(map(str, a))
-                b = '\n'.join(map(str, b))
-                assert a == b
-        """
-        )
+
+        def test_many_lines():
+            lines_a = [str(i)[0] * line_len for i in range(line_count)]
+            lines_b = lines_a[::2]
+            a = "\n".join(map(str, lines_a))
+            b = "\n".join(map(str, lines_b))
+            assert a == b
+
+        def run(*args: str):
+            return run_tests(
+                test_many_lines,
+                spec=assertion_spec(tmp_path, *args),
+                capture_output=True,
+            )
+
         monkeypatch.delenv("CI", raising=False)
 
-        result = pytester.runpytest()
         # without -vv, truncate the message showing a few diff lines only
-        result.stdout.fnmatch_lines(
+        run().stdout.fnmatch_lines(
             [
                 "*+ 1*",
                 "*+ 3*",
@@ -1766,13 +1946,11 @@ class TestTruncateExplanation:
             ]
         )
 
-        result = pytester.runpytest("-vv")
-        result.stdout.fnmatch_lines(["* 6*"])
+        run("-vv").stdout.fnmatch_lines(["* 6*"])
 
         # Setting CI to empty string is same as having it undefined
         monkeypatch.setenv("CI", "")
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        run().stdout.fnmatch_lines(
             [
                 "*+ 1*",
                 "*+ 3*",
@@ -1781,8 +1959,7 @@ class TestTruncateExplanation:
         )
 
         monkeypatch.setenv("CI", "1")
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["* 6*"])
+        run().stdout.fnmatch_lines(["* 6*"])
 
     @pytest.mark.parametrize(
         ["truncation_lines", "truncation_chars", "expected_lines_hidden"],
@@ -1801,20 +1978,17 @@ class TestTruncateExplanation:
     def test_truncation_with_ini(
         self,
         monkeypatch,
-        pytester: Pytester,
+        tmp_path: Path,
         truncation_lines: int | None,
         truncation_chars: int | None,
         expected_lines_hidden: int,
     ) -> None:
-        pytester.makepyfile(
-            """\
-            string_a = "123456789\\n23456789\\n3"
-            string_b = "123456789\\n23456789\\n4"
-
-            def test():
-                assert string_a == string_b
-            """
-        )
+        # Module-level globals in the original; ensemble sources share the
+        # *host* module's globals, so these have to be locals.
+        def test():
+            string_a = "123456789\n23456789\n3"
+            string_b = "123456789\n23456789\n4"
+            assert string_a == string_b
 
         # This test produces 6 lines of diff output or 79 characters
         # So the effect should be when threshold is < 4 lines (considering 2 additional lines for explanation)
@@ -1822,20 +1996,21 @@ class TestTruncateExplanation:
 
         monkeypatch.delenv("CI", raising=False)
 
-        ini = "[pytest]\n"
+        inicfg = {}
         if truncation_lines is not None:
-            ini += f"truncation_limit_lines = {truncation_lines}\n"
+            inicfg["truncation_limit_lines"] = str(truncation_lines)
         if truncation_chars is not None:
-            ini += f"truncation_limit_chars = {truncation_chars}\n"
-        pytester.makeini(ini)
+            inicfg["truncation_limit_chars"] = str(truncation_chars)
 
-        result = pytester.runpytest()
+        record = run_tests(
+            test, spec=assertion_spec(tmp_path, **inicfg), capture_output=True
+        )
 
         if expected_lines_hidden != 0:
-            result.stdout.fnmatch_lines(["*Full output truncated*"])
+            record.stdout.fnmatch_lines(["*Full output truncated*"])
         else:
-            result.stdout.no_fnmatch_line("*truncated*")
-            result.stdout.fnmatch_lines(
+            record.stdout.no_fnmatch_line("*truncated*")
+            record.stdout.fnmatch_lines(
                 [
                     "*- 4*",
                     "*+ 3*",
@@ -1883,6 +2058,9 @@ class TestTruncateExplanation:
             ),
         ],
     )
+    # ensemble: the subject is how a ``pyproject.toml`` section is parsed into
+    # ini values, and an ensemble's ``inicfg`` is authoritative - no config
+    # file is ever read.
     def test_truncation_limits_accept_int_and_string(
         self, monkeypatch, pytester: Pytester, config: str
     ) -> None:
@@ -2156,6 +2334,8 @@ class TestAssertReprCompareDispatcher:
         assert not any("\x1b[" in line for line in result)
 
 
+# ensemble: the subject is the rewriter compiling a *module* whose last line is
+# a comment; an ensemble source is a function object the host already compiled.
 def test_python25_compile_issue257(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2174,6 +2354,9 @@ def test_python25_compile_issue257(pytester: Pytester) -> None:
     )
 
 
+# ensemble: an ensemble source's globals are this (already rewritten) module's
+# globals, so "@py_builtins" would be found no matter what - a green test that
+# asserts nothing.
 def test_rewritten(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2243,32 +2426,62 @@ def test_reprcompare_whitespaces() -> None:
 
 class TestSetAssertions:
     @pytest.mark.parametrize("op", [">=", ">", "<=", "<", "=="])
-    def test_set_extra_item(self, op, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            f"""
+    def test_set_extra_item(self, op, tmp_path: Path) -> None:
+        # One source per operator: the rendered ``assert`` line is what is
+        # asserted on, so the operator has to be in the source text itself.
+        if op == ">=":
+
             def test_hello():
                 x = set("hello x")
                 y = set("hello y")
-                assert x {op} y
-        """
-        )
+                assert x >= y
 
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        elif op == ">":
+
+            def test_hello():
+                x = set("hello x")
+                y = set("hello y")
+                assert x > y
+
+        elif op == "<=":
+
+            def test_hello():
+                x = set("hello x")
+                y = set("hello y")
+                assert x <= y
+
+        elif op == "<":
+
+            def test_hello():
+                x = set("hello x")
+                y = set("hello y")
+                assert x < y
+
+        else:
+
+            def test_hello():
+                x = set("hello x")
+                y = set("hello y")
+                assert x == y
+
+        record = run_tests(
+            test_hello, spec=assertion_spec(tmp_path), capture_output=True
+        )
+        record.stdout.fnmatch_lines(
             [
                 "*def test_hello():*",
                 f"*assert x {op} y*",
             ]
         )
         if op in [">=", ">", "=="]:
-            result.stdout.fnmatch_lines(
+            record.stdout.fnmatch_lines(
                 [
                     "*E*Extra items in the right set:*",
                     "*E*'y'",
                 ]
             )
         if op in ["<=", "<", "=="]:
-            result.stdout.fnmatch_lines(
+            record.stdout.fnmatch_lines(
                 [
                     "*E*Extra items in the left set:*",
                     "*E*'x'",
@@ -2276,18 +2489,32 @@ class TestSetAssertions:
             )
 
     @pytest.mark.parametrize("op", [">", "<", "!="])
-    def test_set_proper_superset_equal(self, pytester: Pytester, op) -> None:
-        pytester.makepyfile(
-            f"""
+    def test_set_proper_superset_equal(self, tmp_path: Path, op) -> None:
+        if op == ">":
+
             def test_hello():
                 x = set([1, 2, 3])
                 y = x.copy()
-                assert x {op} y
-        """
-        )
+                assert x > y
 
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        elif op == "<":
+
+            def test_hello():
+                x = set([1, 2, 3])
+                y = x.copy()
+                assert x < y
+
+        else:
+
+            def test_hello():
+                x = set([1, 2, 3])
+                y = x.copy()
+                assert x != y
+
+        record = run_tests(
+            test_hello, spec=assertion_spec(tmp_path), capture_output=True
+        )
+        record.stdout.fnmatch_lines(
             [
                 "*def test_hello():*",
                 f"*assert x {op} y*",
@@ -2295,18 +2522,17 @@ class TestSetAssertions:
             ]
         )
 
-    def test_pytest_assertrepr_compare_integration(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_hello():
-                x = set(range(100))
-                y = x.copy()
-                y.remove(50)
-                assert x == y
-        """
+    def test_pytest_assertrepr_compare_integration(self, tmp_path: Path) -> None:
+        def test_hello():
+            x = set(range(100))
+            y = x.copy()
+            y.remove(50)
+            assert x == y
+
+        record = run_tests(
+            test_hello, spec=assertion_spec(tmp_path), capture_output=True
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "*def test_hello():*",
                 "*assert x == y*",
@@ -2317,29 +2543,27 @@ class TestSetAssertions:
         )
 
     @pytest.mark.parametrize("op", [">=", "<="])
-    def test_dict_items_view_subset(self, op, pytester: Pytester) -> None:
+    def test_dict_items_view_subset(self, op, tmp_path: Path) -> None:
         """dict.items() supports set-like comparisons; assert diff should show the missing items."""
         if op == ">=":
-            pytester.makepyfile(
-                """
-                def test_hello():
-                    x = {"a": 1, "b": 2}
-                    y = {"a": 1, "b": 2, "c": 3}
-                    assert x.items() >= y.items()
-            """
-            )
+
+            def test_hello():
+                x = {"a": 1, "b": 2}
+                y = {"a": 1, "b": 2, "c": 3}
+                assert x.items() >= y.items()
+
         else:
-            pytester.makepyfile(
-                """
-                def test_hello():
-                    x = {"a": 1, "b": 2, "c": 3}
-                    y = {"a": 1, "b": 2}
-                    assert x.items() <= y.items()
-            """
-            )
-        result = pytester.runpytest()
+
+            def test_hello():
+                x = {"a": 1, "b": 2, "c": 3}
+                y = {"a": 1, "b": 2}
+                assert x.items() <= y.items()
+
+        record = run_tests(
+            test_hello, spec=assertion_spec(tmp_path), capture_output=True
+        )
         side = "right" if op == ">=" else "left"
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             [
                 "*def test_hello():*",
                 f"*assert x.items() {op} y.items()*",
@@ -2349,6 +2573,8 @@ class TestSetAssertions:
         )
 
 
+# ensemble: three sibling directories, each with its own conftest; conftest
+# visibility is per-directory and an ensemble has no directory tree.
 def test_assertrepr_loaded_per_dir(pytester: Pytester) -> None:
     pytester.makepyfile(test_base=["def test_base(): assert 1 == 2"])
     a = pytester.mkdir("a")
@@ -2375,6 +2601,8 @@ def test_assertrepr_loaded_per_dir(pytester: Pytester) -> None:
     )
 
 
+# ensemble: the subject is that "--assert=plain" turns the *rewriting* off, and
+# ensemble sources are rewritten by the host whatever the nested config says.
 def test_assertion_options(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2389,18 +2617,23 @@ def test_assertion_options(pytester: Pytester) -> None:
     result.stdout.no_fnmatch_line("*3 == 4*")
 
 
-def test_triple_quoted_string_issue113(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_hello():
-            assert "" == '''
-    '''"""
+def test_triple_quoted_string_issue113(tmp_path: Path) -> None:
+    def test_hello():
+        assert (
+            ""  # type: ignore[comparison-overlap]
+            == """
+"""
+        )
+
+    record = run_tests(
+        test_hello, spec=assertion_spec(tmp_path, "--fulltrace"), capture_output=True
     )
-    result = pytester.runpytest("--fulltrace")
-    result.stdout.fnmatch_lines(["*1 failed*"])
-    result.stdout.no_fnmatch_line("*SyntaxError*")
+    record.stdout.fnmatch_lines(["*1 failed*"])
+    record.stdout.no_fnmatch_line("*SyntaxError*")
 
 
+# ensemble: every expected line is a "file:line" of the failing source, which
+# is host-anchored (this file, at its own absolute line numbers).
 def test_traceback_failure(pytester: Pytester) -> None:
     p1 = pytester.makepyfile(
         """
@@ -2456,6 +2689,8 @@ def test_traceback_failure(pytester: Pytester) -> None:
     )
 
 
+# ensemble: multiprocessing needs an importable module-level target function,
+# so the test subject has to live in a real file.
 def test_exception_handling_no_traceback(pytester: Pytester) -> None:
     """Handle chain exceptions in tasks submitted by the multiprocess module (#1984)."""
     p1 = pytester.makepyfile(
@@ -2513,6 +2748,7 @@ def test_exception_handling_no_traceback(pytester: Pytester) -> None:
         ),
     ],
 )
+# ensemble: needs a subprocess started with "python -OO".
 def test_warn_missing(pytester: Pytester, cmdline_args, warning_output) -> None:
     pytester.makepyfile("")
 
@@ -2520,6 +2756,8 @@ def test_warn_missing(pytester: Pytester, cmdline_args, warning_output) -> None:
     result.stdout.fnmatch_lines(warning_output)
 
 
+# ensemble: the subject is collecting a file from disk under a custom
+# "python_files"; ensemble collection is preset, never path-driven.
 def test_recursion_source_decode(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2541,34 +2779,27 @@ def test_recursion_source_decode(pytester: Pytester) -> None:
     )
 
 
-def test_AssertionError_message(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_hello():
-            x,y = 1,2
-            assert 0, (x,y)
-    """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+def test_AssertionError_message(tmp_path: Path) -> None:
+    def test_hello():
+        x, y = 1, 2
+        assert 0, (x, y)
+
+    record = run_tests(test_hello, spec=assertion_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(
         """
         *def test_hello*
-        *assert 0, (x,y)*
+        *assert 0, (x, y)*
         *AssertionError: (1, 2)*
     """
     )
 
 
-def test_diff_newline_at_end(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        r"""
-        def test_diff():
-            assert 'asdf' == 'asdf\n'
-    """
-    )
+def test_diff_newline_at_end(tmp_path: Path) -> None:
+    def test_diff():
+        assert "asdf" == "asdf\n"  # type: ignore[comparison-overlap]
 
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record = run_tests(test_diff, spec=assertion_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(
         r"""
         *assert 'asdf' == 'asdf\n'
         *  - asdf
@@ -2578,6 +2809,10 @@ def test_diff_newline_at_end(pytester: Pytester) -> None:
     )
 
 
+# ensemble: the "assertion is always true" warning is emitted by the *rewriter*
+# while compiling a module, with that module's own file:line - both of which
+# are the host's here (and the host's "filterwarnings = error" would turn the
+# warning into an import error of this very file).
 @pytest.mark.filterwarnings("default")
 def test_assert_tuple_warning(pytester: Pytester) -> None:
     msg = "assertion is always true"
@@ -2601,6 +2836,8 @@ def test_assert_tuple_warning(pytester: Pytester) -> None:
     assert msg not in result.stdout.str()
 
 
+# ensemble: same as above - the absence of a rewrite-time warning can only be
+# observed for a module the run under test rewrote itself.
 def test_assert_indirect_tuple_no_warning(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2614,44 +2851,44 @@ def test_assert_indirect_tuple_no_warning(pytester: Pytester) -> None:
     assert "WR1" not in output
 
 
-def test_assert_with_unicode(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """\
-        def test_unicode():
-            assert '유니코드' == 'Unicode'
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["*AssertionError*"])
+def test_assert_with_unicode(tmp_path: Path) -> None:
+    def test_unicode():
+        assert "유니코드" == "Unicode"  # type: ignore[comparison-overlap]
+
+    record = run_tests(test_unicode, spec=assertion_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(["*AssertionError*"])
 
 
-def test_raise_unprintable_assertion_error(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        r"""
-        def test_raise_assertion_error():
-            raise AssertionError('\xff')
-    """
+def test_raise_unprintable_assertion_error(tmp_path: Path) -> None:
+    def test_raise_assertion_error():
+        raise AssertionError("\xff")
+
+    record = run_tests(
+        test_raise_assertion_error, spec=assertion_spec(tmp_path), capture_output=True
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
-        [r">       raise AssertionError('\xff')", "E       AssertionError: *"]
+    # The rendered source line is this file's, dedented by the traceback
+    # formatter - only the quoting follows this file's formatting.
+    record.stdout.fnmatch_lines(
+        [r'>       raise AssertionError("\xff")', "E       AssertionError: *"]
     )
 
 
-def test_raise_assertion_error_raising_repr(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        class RaisingRepr(object):
-            def __repr__(self):
-                raise Exception()
-        def test_raising_repr():
-            raise AssertionError(RaisingRepr())
-    """
+def test_raise_assertion_error_raising_repr(tmp_path: Path) -> None:
+    class RaisingRepr:
+        def __repr__(self):
+            raise Exception()
+
+    def test_raising_repr():
+        raise AssertionError(RaisingRepr())
+
+    record = run_tests(
+        test_raising_repr, spec=assertion_spec(tmp_path), capture_output=True
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["E       AssertionError: <exception str() failed>"])
+    record.stdout.fnmatch_lines(["E       AssertionError: <exception str() failed>"])
 
 
+# ensemble: the failure happens while *importing* the test module, and an
+# ensemble module object is never imported.
 def test_issue_1944(pytester: Pytester) -> None:
     pytester.makepyfile(
         """
@@ -2681,75 +2918,75 @@ def test_exit_from_assertrepr_compare(monkeypatch) -> None:
         callequal(1, 1)
 
 
-def test_plugin_hook_returning_none_is_skipped(pytester: Pytester) -> None:
+def test_plugin_hook_returning_none_is_skipped(tmp_path: Path) -> None:
     """A ``pytest_assertrepr_compare`` impl returning ``None`` is skipped
     so the next impl (or the built-in) can produce the explanation."""
-    pytester.makeconftest(
-        """
-        def pytest_assertrepr_compare(op, left, right):
+
+    class Conftest:
+        def pytest_assertrepr_compare(self, op, left, right):
             # Always defer to the next plugin / the built-in.
             return None
-        """
+
+    def test_diff():
+        assert {1, 2} == {1, 3}
+
+    record = run_tests(
+        test_diff,
+        spec=assertion_spec(tmp_path).with_plugins(Conftest()),
+        capture_output=True,
     )
-    pytester.makepyfile(
-        """
-        def test_diff():
-            assert {1, 2} == {1, 3}
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         ["*Extra items in the left set:*", "*Extra items in the right set:*"]
     )
 
 
-def test_plugin_hook_returning_empty_iterator_is_skipped(pytester: Pytester) -> None:
+def test_plugin_hook_returning_empty_iterator_is_skipped(tmp_path: Path) -> None:
     """A plugin returning a truthy but ultimately empty iterable is
     skipped after materialisation."""
-    pytester.makeconftest(
-        """
-        def pytest_assertrepr_compare(op, left, right):
+
+    class Conftest:
+        def pytest_assertrepr_compare(self, op, left, right):
             return iter([])
-        """
+
+    def test_diff():
+        assert {1, 2} == {1, 3}
+
+    record = run_tests(
+        test_diff,
+        spec=assertion_spec(tmp_path).with_plugins(Conftest()),
+        capture_output=True,
     )
-    pytester.makepyfile(
-        """
-        def test_diff():
-            assert {1, 2} == {1, 3}
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         ["*Extra items in the left set:*", "*Extra items in the right set:*"]
     )
 
 
 def test_callbinrepr_falls_through_when_all_hooks_return_none(
-    pytester: Pytester,
+    tmp_path: Path,
 ) -> None:
     """When no ``pytest_assertrepr_compare`` impl produces an explanation,
     the plain assert rewrite is shown."""
-    pytester.makepyfile(
-        """
-        def test_trivial():
-            assert 1 == 2
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["*assert 1 == 2*"])
-    result.assert_outcomes(failed=1)
+
+    def test_trivial():
+        assert 1 == 2  # type: ignore[comparison-overlap]
+
+    record = run_tests(test_trivial, spec=assertion_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(["*assert 1 == 2*"])
+    record.assert_outcomes(failed=1)
 
 
-def test_callbinrepr_plain_assert_mode(pytester: Pytester) -> None:
+def test_callbinrepr_plain_assert_mode(tmp_path: Path) -> None:
     """In ``--assert=plain`` mode the comparison explanation is still produced."""
-    pytester.makepyfile(
-        """
-        def test_diff():
-            assert {1, 2} == {1, 3}
-        """
+
+    def test_diff():
+        assert {1, 2} == {1, 3}
+
+    record = run_tests(
+        test_diff,
+        spec=assertion_spec(tmp_path, "--assert=plain"),
+        capture_output=True,
     )
-    result = pytester.runpytest("--assert=plain")
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         ["*Extra items in the left set:*", "*Extra items in the right set:*"]
     )
 
@@ -2773,19 +3010,22 @@ def test_exception_before_first_yield_emits_summary_and_notice(monkeypatch) -> N
     assert any("ValueError" in line or "synthetic" in line for line in expl)
 
 
-def test_assertion_location_with_coverage(pytester: Pytester) -> None:
+def test_assertion_location_with_coverage(tmp_path: Path) -> None:
     """This used to report the wrong location when run with coverage (#5754)."""
-    p = pytester.makepyfile(
-        """
-        def test():
-            assert False, 1
-            assert False, 2
-        """
-    )
-    result = pytester.runpytest(str(p))
-    result.stdout.fnmatch_lines(
+    # The messages are names rather than the original's int literals: as real
+    # code the source is linted, and ``assert False, 1`` is RUF040. What the
+    # test is about - the reported location being the *first* assert - is
+    # unaffected.
+    first, second = 1, 2
+
+    def test():
+        assert False, first
+        assert False, second
+
+    record = run_tests(test, spec=assertion_spec(tmp_path), capture_output=True)
+    record.stdout.fnmatch_lines(
         [
-            ">       assert False, 1",
+            ">       assert False, first",
             "E       AssertionError: 1",
             "E       assert False",
             "*= 1 failed in*",
@@ -2810,13 +3050,10 @@ def test_reprcompare_verbose_long() -> None:
 
 @pytest.mark.parametrize("enable_colors", [True, False])
 @pytest.mark.parametrize(
-    ("test_code", "expected_lines"),
+    ("case", "expected_lines"),
     (
         (
-            """
-            def test():
-                assert [0, 1] == [0, 2]
-            """,
+            "list",
             [
                 "{bold}{red}E         At index 1 diff: {reset}{number}1{hl-reset}{endline} != {reset}{number}2*",
                 "{bold}{red}E         {reset}{light-red}-     2,{hl-reset}{endline}{reset}",
@@ -2824,12 +3061,7 @@ def test_reprcompare_verbose_long() -> None:
             ],
         ),
         (
-            """
-            def test():
-                assert {f"number-is-{i}": i for i in range(1, 6)} == {
-                    f"number-is-{i}": i for i in range(5)
-                }
-            """,
+            "dict",
             [
                 "{bold}{red}E         Common items:{reset}",
                 "{bold}{red}E         {reset}{{{str}'{hl-reset}{str}number-is-1{hl-reset}{str}'{hl-reset}: {number}1*",
@@ -2843,10 +3075,7 @@ def test_reprcompare_verbose_long() -> None:
             ],
         ),
         (
-            """
-            def test():
-                assert "abcd" == "abce"
-            """,
+            "text",
             [
                 "{bold}{red}E         {reset}{light-red}- abce{hl-reset}{endline}{reset}",
                 "{bold}{red}E         {light-green}+ abcd{hl-reset}{endline}{reset}",
@@ -2855,11 +3084,31 @@ def test_reprcompare_verbose_long() -> None:
     ),
 )
 def test_comparisons_handle_colors(
-    pytester: Pytester, color_mapping, enable_colors, test_code, expected_lines
+    tmp_path: Path, color_mapping, enable_colors, case, expected_lines
 ) -> None:
-    p = pytester.makepyfile(test_code)
-    result = pytester.runpytest(
-        f"--color={'yes' if enable_colors else 'no'}", "-vv", str(p)
+    if case == "list":
+
+        def test():
+            assert [0, 1] == [0, 2]
+
+    elif case == "dict":
+
+        def test():
+            assert {f"number-is-{i}": i for i in range(1, 6)} == {
+                f"number-is-{i}": i for i in range(5)
+            }
+
+    else:
+
+        def test():
+            assert "abcd" == "abce"  # type: ignore[comparison-overlap]
+
+    record = run_tests(
+        test,
+        spec=assertion_spec(
+            tmp_path, f"--color={'yes' if enable_colors else 'no'}", "-vv"
+        ),
+        capture_output=True,
     )
     formatter = (
         color_mapping.format_for_fnmatch
@@ -2867,45 +3116,44 @@ def test_comparisons_handle_colors(
         else color_mapping.strip_colors
     )
 
-    result.stdout.fnmatch_lines(formatter(expected_lines), consecutive=False)
+    record.stdout.fnmatch_lines(formatter(expected_lines), consecutive=False)
 
 
-def test_fine_grained_assertion_verbosity(pytester: Pytester):
+def test_fine_grained_assertion_verbosity(tmp_path: Path):
     long_text = "Lorem ipsum dolor sit amet " * 10
-    p = pytester.makepyfile(
-        f"""
-        def test_ok():
-            pass
 
+    def test_ok():
+        pass
 
-        def test_words_fail():
-            fruits1 = ["banana", "apple", "grapes", "melon", "kiwi"]
-            fruits2 = ["banana", "apple", "orange", "melon", "kiwi"]
-            assert fruits1 == fruits2
+    def test_words_fail():
+        fruits1 = ["banana", "apple", "grapes", "melon", "kiwi"]
+        fruits2 = ["banana", "apple", "orange", "melon", "kiwi"]
+        assert fruits1 == fruits2
 
+    def test_numbers_fail():
+        number_to_text1 = {str(x): x for x in range(5)}
+        number_to_text2 = {str(x * 10): x * 10 for x in range(5)}
+        assert number_to_text1 == number_to_text2
 
-        def test_numbers_fail():
-            number_to_text1 = {{str(x): x for x in range(5)}}
-            number_to_text2 = {{str(x * 10): x * 10 for x in range(5)}}
-            assert number_to_text1 == number_to_text2
+    def test_long_text_fail():
+        assert "hello world" in long_text
 
-
-        def test_long_text_fail():
-            long_text = "{long_text}"
-            assert "hello world" in long_text
-        """
+    record = run_tests(
+        test_ok,
+        test_words_fail,
+        test_numbers_fail,
+        test_long_text_fail,
+        spec=assertion_spec(tmp_path, verbosity_assertions="2"),
+        capture_output=True,
     )
-    pytester.makeini(
-        """
-        [pytest]
-        verbosity_assertions = 2
-        """
-    )
-    result = pytester.runpytest(p)
 
-    result.stdout.fnmatch_lines(
+    # Replaces the original's ".FFF [100%]" progress line: the ensemble drives
+    # the runtest protocol directly, so the terminal reporter never writes the
+    # end-of-file progress fill.
+    record.assert_outcomes(passed=1, failed=3)
+
+    record.stdout.fnmatch_lines(
         [
-            f"{p.name} .FFF                            [100%]",
             "E         At index 2 diff: 'grapes' != 'orange'",
             "E         Full diff: (-: missing in left side, +: extra in left side)",
             "E           [",
@@ -2940,27 +3188,22 @@ def test_fine_grained_assertion_verbosity(pytester: Pytester):
 
 
 def test_assertion_text_diff_style_block_for_multiline_strings(
-    pytester: Pytester,
+    tmp_path: Path,
 ) -> None:
-    pytester.makepyfile(
-        r"""
+    # Module-level globals in the original; an ensemble source's globals are
+    # this module's, so these are locals.
+    def test_text_diff():
         actual = "alpha\n  beta\n"
         expected = "alpha\n    beta"
+        assert actual == expected
 
-        def test_text_diff():
-            assert actual == expected
-        """
-    )
-    pytester.makeini(
-        """
-        [pytest]
-        assertion_text_diff_style = block
-        """
+    record = run_tests(
+        test_text_diff,
+        spec=assertion_spec(tmp_path, "-vv", assertion_text_diff_style="block"),
+        capture_output=True,
     )
 
-    result = pytester.runpytest("-vv")
-
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "E         Left:",
             "E           alpha",
@@ -2971,28 +3214,22 @@ def test_assertion_text_diff_style_block_for_multiline_strings(
             "E               beta",
         ]
     )
-    result.stdout.no_fnmatch_line("*?     -*")
+    record.stdout.no_fnmatch_line("*?     -*")
 
 
 def test_assertion_text_diff_style_block_for_single_line_strings(
-    pytester: Pytester,
+    tmp_path: Path,
 ) -> None:
-    pytester.makepyfile(
-        """
-        def test_text_diff():
-            assert "spam" == "eggs"
-        """
-    )
-    pytester.makeini(
-        """
-        [pytest]
-        assertion_text_diff_style = block
-        """
+    def test_text_diff():
+        assert "spam" == "eggs"  # type: ignore[comparison-overlap]
+
+    record = run_tests(
+        test_text_diff,
+        spec=assertion_spec(tmp_path, "-vv", assertion_text_diff_style="block"),
+        capture_output=True,
     )
 
-    result = pytester.runpytest("-vv")
-
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "E         Left:",
             "E           spam",
@@ -3000,34 +3237,32 @@ def test_assertion_text_diff_style_block_for_single_line_strings(
             "E           eggs",
         ]
     )
-    result.stdout.no_fnmatch_line("*- eggs*")
+    record.stdout.no_fnmatch_line("*- eggs*")
 
 
-def test_assertion_text_diff_style_invalid(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_ok():
-            pass
-        """
-    )
-    pytester.makeini(
-        """
-        [pytest]
-        assertion_text_diff_style = side-by-side
-        """
-    )
+def test_assertion_text_diff_style_invalid(tmp_path: Path) -> None:
+    def test_ok():
+        pass
 
-    result = pytester.runpytest()
-
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(
-        [
-            "*ERROR: *: config option 'assertion_text_diff_style' expects one of "
-            "'ndiff' | 'block', got 'side-by-side'"
-        ]
-    )
+    # The ini value is validated from ``pytest_configure``; the ensemble sees
+    # the ``UsageError`` a command line run renders to stderr and turns into
+    # ``ExitCode.USAGE_ERROR``.
+    with pytest.raises(
+        UsageError,
+        match=(
+            "config option 'assertion_text_diff_style' expects one of "
+            r"'ndiff' \| 'block', got 'side-by-side'"
+        ),
+    ):
+        run_tests(
+            test_ok,
+            spec=assertion_spec(tmp_path, assertion_text_diff_style="side-by-side"),
+        )
 
 
+# ensemble: asserts the failing source's "file:line", which is host-anchored:
+# it points at this file at its own absolute line number, not at the ensemble's
+# synthetic module.
 def test_full_output_vvv(pytester: Pytester) -> None:
     pytester.makepyfile(
         r"""
@@ -3061,6 +3296,8 @@ def test_full_output_vvv(pytester: Pytester) -> None:
     result.stdout.no_fnmatch_line(expected_non_vvv_arg_line)
 
 
+# ensemble: same as above - the closing "test_order.py:*: AssertionError" line
+# is host-anchored.
 def test_dict_extra_items_preserve_insertion_order(pytester: Pytester) -> None:
     """Assertion output of dict diff shows keys in insertion order (#13503)."""
     pytester.makepyfile(

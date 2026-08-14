@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
 import inspect
 import os
@@ -15,6 +16,12 @@ from _pytest import runner
 from _pytest._code import ExceptionInfo
 from _pytest._code.code import ExceptionChainRepr
 from _pytest.config import ExitCode
+from _pytest.ensemble import build_module
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import Ensemble
+from _pytest.ensemble import EnsembleModule
+from _pytest.ensemble import run_tests
+from _pytest.ensemble import Source
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.outcomes import OutcomeException
 from _pytest.pytester import Pytester
@@ -25,40 +32,67 @@ if sys.version_info < (3, 11):
     from exceptiongroup import ExceptionGroup
 
 
+#: A runner for the runtest protocol of a single item, as the test classes
+#: below hand out from ``getrunner``.
+ProtocolRunner = Callable[[pytest.Item], list[reports.TestReport]]
+
+
+def runitem(
+    getrunner: Callable[[], ProtocolRunner],
+    tmp_path: Path,
+    *sources: Source,
+) -> list[reports.TestReport]:
+    """Collect exactly one item from in-memory sources and run it through the
+    protocol runner the calling test class provides.
+
+    The ensemble replacement for :meth:`Pytester.runitem`, which does the same
+    thing with a file on disk and looks the runner up on the calling instance.
+    """
+    with Ensemble(*sources, rootpath=tmp_path) as ensemble:
+        (item,) = ensemble.collect()
+        return getrunner()(item)
+
+
 class TestSetupState:
-    def test_setup(self, pytester: Pytester) -> None:
-        item = pytester.getitem("def test_func(): pass")
-        ss = item.session._setupstate
-        values = [1]
-        ss.setup(item)
-        ss.addfinalizer(values.pop, item)
-        assert values
-        ss.teardown_exact(None)
-        assert not values
+    def test_setup(self, tmp_path: Path) -> None:
+        def test_func(): ...
 
-    def test_teardown_exact_stack_empty(self, pytester: Pytester) -> None:
-        item = pytester.getitem("def test_func(): pass")
-        ss = item.session._setupstate
-        ss.setup(item)
-        ss.teardown_exact(None)
-        ss.teardown_exact(None)
-        ss.teardown_exact(None)
-
-    def test_setup_fails_and_failure_is_cached(self, pytester: Pytester) -> None:
-        item = pytester.getitem(
-            """
-            def setup_module(mod):
-                raise ValueError(42)
-            def test_func(): pass
-        """
-        )
-        ss = item.session._setupstate
-        with pytest.raises(ValueError):
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            ss = item.session._setupstate
+            values = [1]
             ss.setup(item)
-        with pytest.raises(ValueError):
-            ss.setup(item)
+            ss.addfinalizer(values.pop, item)
+            assert values
+            ss.teardown_exact(None)
+            assert not values
 
-    def test_teardown_multiple_one_fails(self, pytester: Pytester) -> None:
+    def test_teardown_exact_stack_empty(self, tmp_path: Path) -> None:
+        def test_func(): ...
+
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            ss = item.session._setupstate
+            ss.setup(item)
+            ss.teardown_exact(None)
+            ss.teardown_exact(None)
+            ss.teardown_exact(None)
+
+    def test_setup_fails_and_failure_is_cached(self, tmp_path: Path) -> None:
+        def setup_module(mod):
+            raise ValueError(42)
+
+        def test_func(): ...
+
+        with Ensemble(setup_module, test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            ss = item.session._setupstate
+            with pytest.raises(ValueError):
+                ss.setup(item)
+            with pytest.raises(ValueError):
+                ss.setup(item)
+
+    def test_teardown_multiple_one_fails(self, tmp_path: Path) -> None:
         r = []
 
         def fin1():
@@ -70,39 +104,46 @@ class TestSetupState:
         def fin3():
             r.append("fin3")
 
-        item = pytester.getitem("def test_func(): pass")
-        ss = item.session._setupstate
-        ss.setup(item)
-        ss.addfinalizer(fin1, item)
-        ss.addfinalizer(fin2, item)
-        ss.addfinalizer(fin3, item)
-        with pytest.raises(Exception) as err:
-            ss.teardown_exact(None)
-        assert err.value.args == ("oops",)
-        assert r == ["fin3", "fin1"]
+        def test_func(): ...
 
-    def test_teardown_multiple_fail(self, pytester: Pytester) -> None:
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            ss = item.session._setupstate
+            ss.setup(item)
+            ss.addfinalizer(fin1, item)
+            ss.addfinalizer(fin2, item)
+            ss.addfinalizer(fin3, item)
+            with pytest.raises(Exception) as err:
+                ss.teardown_exact(None)
+            assert err.value.args == ("oops",)
+            assert r == ["fin3", "fin1"]
+
+    def test_teardown_multiple_fail(self, tmp_path: Path) -> None:
         def fin1():
             raise Exception("oops1")
 
         def fin2():
             raise Exception("oops2")
 
-        item = pytester.getitem("def test_func(): pass")
-        ss = item.session._setupstate
-        ss.setup(item)
-        ss.addfinalizer(fin1, item)
-        ss.addfinalizer(fin2, item)
-        with pytest.raises(ExceptionGroup) as err:
-            ss.teardown_exact(None)
+        def test_func(): ...
 
-        # Note that finalizers are run LIFO, but because FIFO is more intuitive for
-        # users we reverse the order of messages, and see the error from fin1 first.
-        err1, err2 = err.value.exceptions
-        assert err1.args == ("oops1",)
-        assert err2.args == ("oops2",)
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            ss = item.session._setupstate
+            ss.setup(item)
+            ss.addfinalizer(fin1, item)
+            ss.addfinalizer(fin2, item)
+            with pytest.raises(ExceptionGroup) as err:
+                ss.teardown_exact(None)
 
-    def test_teardown_multiple_scopes_one_fails(self, pytester: Pytester) -> None:
+            # Note that finalizers are run LIFO, but because FIFO is more intuitive
+            # for users we reverse the order of messages, and see the error from
+            # fin1 first.
+            err1, err2 = err.value.exceptions
+            assert err1.args == ("oops1",)
+            assert err2.args == ("oops2",)
+
+    def test_teardown_multiple_scopes_one_fails(self, tmp_path: Path) -> None:
         module_teardown = []
 
         def fin_func():
@@ -111,35 +152,51 @@ class TestSetupState:
         def fin_module():
             module_teardown.append("fin_module")
 
-        item = pytester.getitem("def test_func(): pass")
-        mod = item.listchain()[-2]
-        ss = item.session._setupstate
-        ss.setup(item)
-        ss.addfinalizer(fin_module, mod)
-        ss.addfinalizer(fin_func, item)
-        with pytest.raises(Exception, match="oops1"):
-            ss.teardown_exact(None)
-        assert module_teardown == ["fin_module"]
+        def test_func(): ...
 
-    def test_teardown_multiple_scopes_several_fail(self, pytester) -> None:
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            mod = item.listchain()[-2]
+            ss = item.session._setupstate
+            ss.setup(item)
+            ss.addfinalizer(fin_module, mod)
+            ss.addfinalizer(fin_func, item)
+            with pytest.raises(Exception, match="oops1"):
+                ss.teardown_exact(None)
+            assert module_teardown == ["fin_module"]
+
+    def test_teardown_multiple_scopes_several_fail(self, tmp_path: Path) -> None:
         def raiser(exc):
             raise exc
 
-        item = pytester.getitem("def test_func(): pass")
-        mod = item.listchain()[-2]
-        ss = item.session._setupstate
-        ss.setup(item)
-        ss.addfinalizer(partial(raiser, KeyError("from module scope")), mod)
-        ss.addfinalizer(partial(raiser, TypeError("from function scope 1")), item)
-        ss.addfinalizer(partial(raiser, ValueError("from function scope 2")), item)
+        def test_func(): ...
 
-        with pytest.raises(ExceptionGroup, match="errors during test teardown") as e:
-            ss.teardown_exact(None)
-        mod, func = e.value.exceptions
-        assert isinstance(mod, KeyError)
-        assert isinstance(func.exceptions[0], TypeError)
-        assert isinstance(func.exceptions[1], ValueError)
+        with Ensemble(test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            mod = item.listchain()[-2]
+            ss = item.session._setupstate
+            ss.setup(item)
+            ss.addfinalizer(partial(raiser, KeyError("from module scope")), mod)
+            ss.addfinalizer(partial(raiser, TypeError("from function scope 1")), item)
+            ss.addfinalizer(partial(raiser, ValueError("from function scope 2")), item)
 
+            with pytest.raises(
+                ExceptionGroup, match="errors during test teardown"
+            ) as e:
+                ss.teardown_exact(None)
+        # renamed from ``mod``/``func``: the module collector above already
+        # holds ``mod``, and mypy now checks this function because it takes an
+        # annotated ``tmp_path`` rather than a bare ``pytester``
+        mod_exc, func_exc = e.value.exceptions
+        assert isinstance(mod_exc, KeyError)
+        assert isinstance(func_exc.exceptions[0], TypeError)
+        assert isinstance(func_exc.exceptions[1], ValueError)
+
+    # ensemble: the subject is a *collector* whose ``setup()`` raises, which is
+    # what caches the exception in ``SetupState``. Ensembles only collect
+    # modules/classes/functions, so there is no way to hand one a custom
+    # ``pytest.Collector`` (nor to serve one from ``pytest_collect_file``, since
+    # the session's collect report is preset).
     def test_cached_exception_doesnt_get_longer(self, pytester: Pytester) -> None:
         """Regression test for #12204 (the "BTW" case)."""
         pytester.makepyfile(test="")
@@ -179,26 +236,25 @@ class TestSetupState:
 
 
 class BaseFunctionalTests:
-    def test_passfunction(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            def test_func():
-                pass
-        """
-        )
+    def getrunner(self) -> ProtocolRunner:
+        """The runtest protocol runner; provided by the concrete subclass."""
+        raise NotImplementedError
+
+    def test_passfunction(self, tmp_path: Path) -> None:
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert rep.passed
         assert not rep.failed
         assert rep.outcome == "passed"
         assert not rep.longrepr
 
-    def test_failfunction(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            def test_func():
-                assert 0
-        """
-        )
+    def test_failfunction(self, tmp_path: Path) -> None:
+        def test_func():
+            assert 0
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert not rep.passed
         assert not rep.skipped
@@ -207,14 +263,11 @@ class BaseFunctionalTests:
         assert rep.outcome == "failed"
         # assert isinstance(rep.longrepr, ReprExceptionInfo)
 
-    def test_skipfunction(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            import pytest
-            def test_func():
-                pytest.skip("hello")
-        """
-        )
+    def test_skipfunction(self, tmp_path: Path) -> None:
+        def test_func():
+            pytest.skip("hello")
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert not rep.failed
         assert not rep.passed
@@ -227,16 +280,13 @@ class BaseFunctionalTests:
         # assert rep.skipped.location.path
         # assert not rep.skipped.failurerepr
 
-    def test_skip_in_setup_function(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            import pytest
-            def setup_function(func):
-                pytest.skip("hello")
-            def test_func():
-                pass
-        """
-        )
+    def test_skip_in_setup_function(self, tmp_path: Path) -> None:
+        def setup_function(func):
+            pytest.skip("hello")
+
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, setup_function, test_func)
         print(reports)
         rep = reports[0]
         assert not rep.failed
@@ -248,16 +298,13 @@ class BaseFunctionalTests:
         assert len(reports) == 2
         assert reports[1].passed  # teardown
 
-    def test_failure_in_setup_function(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            import pytest
-            def setup_function(func):
-                raise ValueError(42)
-            def test_func():
-                pass
-        """
-        )
+    def test_failure_in_setup_function(self, tmp_path: Path) -> None:
+        def setup_function(func):
+            raise ValueError(42)
+
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, setup_function, test_func)
         rep = reports[0]
         assert not rep.skipped
         assert not rep.passed
@@ -265,16 +312,13 @@ class BaseFunctionalTests:
         assert rep.when == "setup"
         assert len(reports) == 2
 
-    def test_failure_in_teardown_function(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            import pytest
-            def teardown_function(func):
-                raise ValueError(42)
-            def test_func():
-                pass
-        """
-        )
+    def test_failure_in_teardown_function(self, tmp_path: Path) -> None:
+        def teardown_function(func):
+            raise ValueError(42)
+
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, teardown_function, test_func)
         print(reports)
         assert len(reports) == 3
         rep = reports[2]
@@ -285,22 +329,16 @@ class BaseFunctionalTests:
         # assert rep.longrepr.reprcrash.lineno == 3
         # assert rep.longrepr.reprtraceback.reprentries
 
-    def test_custom_failure_repr(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            conftest="""
-            import pytest
-            class Function(pytest.Function):
-                def repr_failure(self, excinfo):
-                    return "hello"
-        """
-        )
-        reports = pytester.runitem(
-            """
-            import pytest
-            def test_func():
-                assert 0
-        """
-        )
+    def test_custom_failure_repr(self, tmp_path: Path) -> None:
+        # The original wrote a conftest defining ``class Function(pytest.Function)``
+        # with a custom ``repr_failure``. Node class customization by name was
+        # removed long ago - ``python.py`` instantiates ``Function`` directly - so
+        # that conftest was never consulted, and every assertion that would have
+        # noticed is commented out below. Nothing is lost by dropping it.
+        def test_func():
+            assert 0
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert not rep.skipped
         assert not rep.passed
@@ -310,60 +348,73 @@ class BaseFunctionalTests:
         # assert rep.failed.where.path.basename == "test_func.py"
         # assert rep.failed.failurerepr == "hello"
 
-    def test_teardown_final_returncode(self, pytester: Pytester) -> None:
-        rec = pytester.inline_runsource(
-            """
-            def test_func():
-                pass
-            def teardown_function(func):
-                raise ValueError(42)
-        """
-        )
-        assert rec.ret == 1
+    def test_teardown_final_returncode(self, tmp_path: Path) -> None:
+        def test_func(): ...
 
-    def test_logstart_logfinish_hooks(self, pytester: Pytester) -> None:
-        rec = pytester.inline_runsource(
-            """
-            import pytest
-            def test_func():
-                pass
-        """
-        )
-        reps = rec.getcalls("pytest_runtest_logstart pytest_runtest_logfinish")
-        assert [x._name for x in reps] == [
+        def teardown_function(func):
+            raise ValueError(42)
+
+        with Ensemble(test_func, teardown_function, rootpath=tmp_path) as ensemble:
+            record = ensemble.run()
+            # ``inline_run`` reported ``ret == 1`` here; an ensemble has no
+            # ``wrap_session`` to turn the session into an exit code, so assert
+            # on the counter that exit code is computed from.
+            assert ensemble.session.testsfailed == 1
+        # the call passes and the teardown fails, so this is an error
+        record.assert_outcomes(passed=1, errors=1)
+
+    def test_logstart_logfinish_hooks(self, tmp_path: Path) -> None:
+        events: list[tuple[str, str, tuple[str, int | None, str]]] = []
+
+        class LogHooks:
+            def pytest_runtest_logstart(self, nodeid, location):
+                events.append(("pytest_runtest_logstart", nodeid, location))
+
+            def pytest_runtest_logfinish(self, nodeid, location):
+                events.append(("pytest_runtest_logfinish", nodeid, location))
+
+        def test_func(): ...
+
+        spec = ConfigSpec(rootpath=tmp_path, extra_plugins=(LogHooks(),))
+        with Ensemble(test_func, spec=spec) as ensemble:
+            (item,) = ensemble.collect()
+            ensemble.run()
+
+        assert [name for name, _, _ in events] == [
             "pytest_runtest_logstart",
             "pytest_runtest_logfinish",
         ]
-        for rep in reps:
-            assert rep.nodeid == "test_logstart_logfinish_hooks.py::test_func"
-            assert rep.location == ("test_logstart_logfinish_hooks.py", 1, "test_func")
+        for _, nodeid, location in events:
+            assert nodeid == item.nodeid == "test_ensemble.py::test_func"
+            # the path and line number are host-anchored - the item's code
+            # object really lives in this file - so only the name transfers
+            # verbatim; the rest is asserted against the item it came from.
+            assert location == item.location
+            assert location[2] == "test_func"
 
-    def test_exact_teardown_issue90(self, pytester: Pytester) -> None:
-        rec = pytester.inline_runsource(
-            """
-            import pytest
+    def test_exact_teardown_issue90(self, tmp_path: Path) -> None:
+        class TestClass:
+            def test_method(self): ...
 
-            class TestClass(object):
-                def test_method(self):
-                    pass
-                def teardown_class(cls):
-                    raise Exception()
+            def teardown_class(cls):
+                raise Exception()
 
-            def test_func():
-                import sys
-                # on python2 exc_info is kept till a function exits
-                # so we would end up calling test functions while
-                # sys.exc_info would return the indexerror
-                # from guessing the lastitem
-                excinfo = sys.exc_info()
-                import traceback
-                assert excinfo[0] is None, \
-                       traceback.format_exception(*excinfo)
-            def teardown_function(func):
-                raise ValueError(42)
-        """
-        )
-        reps = rec.getreports("pytest_runtest_logreport")
+        def test_func():
+            import traceback
+
+            # on python2 exc_info is kept till a function exits
+            # so we would end up calling test functions while
+            # sys.exc_info would return the indexerror
+            # from guessing the lastitem
+            excinfo = sys.exc_info()
+            assert excinfo[0] is None, traceback.format_exception(*excinfo)
+
+        def teardown_function(func):
+            raise ValueError(42)
+
+        # collection follows argument order: the class first, then test_func
+        record = run_tests(TestClass, test_func, teardown_function, rootpath=tmp_path)
+        reps = record.reports
         print(reps)
         for i in range(2):
             assert reps[i].nodeid.endswith("test_method")
@@ -378,21 +429,17 @@ class BaseFunctionalTests:
         assert reps[5].nodeid.endswith("test_func")
         assert reps[5].failed
 
-    def test_exact_teardown_issue1206(self, pytester: Pytester) -> None:
+    def test_exact_teardown_issue1206(self, tmp_path: Path) -> None:
         """Issue shadowing error with wrong number of arguments on teardown_method."""
-        rec = pytester.inline_runsource(
-            """
-            import pytest
 
-            class TestClass(object):
-                def teardown_method(self, x, y, z):
-                    pass
+        class TestClass:
+            def teardown_method(self, x, y, z): ...
 
-                def test_method(self):
-                    assert True
-        """
-        )
-        reps = rec.getreports("pytest_runtest_logreport")
+            def test_method(self):
+                assert True
+
+        record = run_tests(TestClass, rootpath=tmp_path)
+        reps = record.reports
         print(reps)
         assert len(reps) == 3
         #
@@ -410,31 +457,26 @@ class BaseFunctionalTests:
         longrepr = reps[2].longrepr
         assert isinstance(longrepr, ExceptionChainRepr)
         assert longrepr.reprcrash
-        assert longrepr.reprcrash.message in (
-            "TypeError: teardown_method() missing 2 required positional arguments: 'y' and 'z'",
-            # Python >= 3.10
-            "TypeError: TestClass.teardown_method() missing 2 required positional arguments: 'y' and 'z'",
+        # the qualname python puts in front is host-anchored - the class is
+        # defined inside this test, so it reads
+        # ``test_exact_teardown_issue1206.<locals>.TestClass.teardown_method``
+        assert longrepr.reprcrash.message.startswith("TypeError: ")
+        assert longrepr.reprcrash.message.endswith(
+            "teardown_method() missing 2 required positional arguments: 'y' and 'z'"
         )
 
     def test_failure_in_setup_function_ignores_custom_repr(
-        self, pytester: Pytester
+        self, tmp_path: Path
     ) -> None:
-        pytester.makepyfile(
-            conftest="""
-            import pytest
-            class Function(pytest.Function):
-                def repr_failure(self, excinfo):
-                    assert 0
-        """
-        )
-        reports = pytester.runitem(
-            """
-            def setup_function(func):
-                raise ValueError(42)
-            def test_func():
-                pass
-        """
-        )
+        # As in test_custom_failure_repr above, the conftest ``Function`` subclass
+        # the original defined has not been consulted by the collection machinery
+        # for a long time, so dropping it changes nothing that was asserted.
+        def setup_function(func):
+            raise ValueError(42)
+
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, setup_function, test_func)
         assert len(reports) == 2
         rep = reports[0]
         print(rep)
@@ -446,98 +488,76 @@ class BaseFunctionalTests:
         # assert rep.outcome.where.path.basename == "test_func.py"
         # assert isinstance(rep.failed.failurerepr, PythonFailureRepr)
 
-    def test_systemexit_does_not_bail_out(self, pytester: Pytester) -> None:
+    def test_systemexit_does_not_bail_out(self, tmp_path: Path) -> None:
+        def test_func():
+            raise SystemExit(42)
+
         try:
-            reports = pytester.runitem(
-                """
-                def test_func():
-                    raise SystemExit(42)
-            """
-            )
+            reports = runitem(self.getrunner, tmp_path, test_func)
         except SystemExit:
             assert False, "runner did not catch SystemExit"
         rep = reports[1]
         assert rep.failed
         assert rep.when == "call"
 
-    def test_exit_propagates(self, pytester: Pytester) -> None:
-        try:
-            pytester.runitem(
-                """
-                import pytest
-                def test_func():
-                    raise pytest.exit.Exception()
-            """
-            )
-        except pytest.exit.Exception:
-            pass
-        else:
-            assert False, "did not raise"
+    def test_exit_propagates(self, tmp_path: Path) -> None:
+        def test_func():
+            raise pytest.exit.Exception()
+
+        with pytest.raises(pytest.exit.Exception):
+            runitem(self.getrunner, tmp_path, test_func)
 
 
 class TestExecutionNonForked(BaseFunctionalTests):
-    def getrunner(self):
+    def getrunner(self) -> ProtocolRunner:
         def f(item):
             return runner.runtestprotocol(item, log=False)
 
         return f
 
-    def test_keyboardinterrupt_propagates(self, pytester: Pytester) -> None:
-        try:
-            pytester.runitem(
-                """
-                def test_func():
-                    raise KeyboardInterrupt("fake")
-            """
-            )
-        except KeyboardInterrupt:
-            pass
-        else:
-            assert False, "did not raise"
+    def test_keyboardinterrupt_propagates(self, tmp_path: Path) -> None:
+        def test_func():
+            raise KeyboardInterrupt("fake")
+
+        with pytest.raises(KeyboardInterrupt):
+            runitem(self.getrunner, tmp_path, test_func)
 
     def test_keyboardinterrupt_clears_request_and_funcargs(
-        self, pytester: Pytester
+        self, tmp_path: Path
     ) -> None:
         """Ensure that an item's fixtures are cleared quickly even if exiting
         early due to a keyboard interrupt (#13626)."""
-        item = pytester.getitem(
-            """
-            import pytest
 
-            @pytest.fixture
-            def resource():
-                return object()
+        @pytest.fixture
+        def resource():
+            return object()
 
-            def test_func(resource):
-                raise KeyboardInterrupt("fake")
-        """
-        )
-        assert isinstance(item, pytest.Function)
-        assert item._request
-        assert item.funcargs == {}
+        def test_func(resource):
+            raise KeyboardInterrupt("fake")
 
-        try:
-            runner.runtestprotocol(item, log=False)
-        except KeyboardInterrupt:
-            pass
-        else:
-            assert False, "did not raise"
+        with Ensemble(resource, test_func, rootpath=tmp_path) as ensemble:
+            (item,) = ensemble.collect()
+            assert isinstance(item, pytest.Function)
+            assert item._request
+            assert item.funcargs == {}
 
-        assert not cast(object, item._request)
-        assert not item.funcargs
+            with pytest.raises(KeyboardInterrupt):
+                runner.runtestprotocol(item, log=False)
+
+            assert not cast(object, item._request)
+            assert not item.funcargs
 
 
 class TestSessionReports:
-    def test_collect_result(self, pytester: Pytester) -> None:
-        col = pytester.getmodulecol(
-            """
-            def test_func1():
-                pass
-            class TestClass(object):
-                pass
-        """
-        )
-        rep = runner.collect_one_node(col)
+    def test_collect_result(self, tmp_path: Path) -> None:
+        def test_func1(): ...
+
+        class TestClass: ...
+
+        module = build_module("test_collect_result", test_func1, TestClass)
+        with Ensemble(rootpath=tmp_path) as ensemble:
+            col = EnsembleModule.from_parent(ensemble.session, obj=module)
+            rep = runner.collect_one_node(col)
         assert not rep.failed
         assert not rep.skipped
         assert rep.passed
@@ -597,6 +617,10 @@ def test_callinfo() -> None:
 # then something like the following functional tests makes sense
 
 
+# ensemble: the subject is a ``pytest_runtest_setup`` hook defined at module
+# level in the test file. Module-level hooks are registered by
+# ``consider_module`` when the module is imported, and an ensemble module is
+# served from memory instead of imported, so its hooks are never registered.
 @pytest.mark.xfail
 def test_runtest_in_module_ordering(pytester: Pytester) -> None:
     p1 = pytester.makepyfile(
@@ -656,6 +680,9 @@ def test_pytest_fail() -> None:
     assert s.startswith("Failed")
 
 
+# ensemble: ``pytest.exit`` from ``pytest_configure`` is rendered onto stderr by
+# ``wrap_session``, which ensembles do not run - the Exit would simply propagate
+# out of ``configured()``.
 def test_pytest_exit_msg(pytester: Pytester) -> None:
     pytester.makeconftest(
         """
@@ -679,6 +706,9 @@ def _strip_resource_warnings(lines):
     ]
 
 
+# ensemble: about the process return code and the stderr message, both produced
+# by ``wrap_session``; inside an ensemble ``pytest.exit`` just propagates as
+# ``Exit``.
 def test_pytest_exit_returncode(pytester: Pytester) -> None:
     pytester.makepyfile(
         """\
@@ -710,22 +740,27 @@ def test_pytest_exit_returncode(pytester: Pytester) -> None:
     assert result.ret == 98
 
 
-def test_pytest_fail_notrace_runtest(pytester: Pytester) -> None:
+def test_pytest_fail_notrace_runtest(tmp_path: Path) -> None:
     """Test pytest.fail(..., pytrace=False) does not show tracebacks during test run."""
-    pytester.makepyfile(
-        """
-        import pytest
-        def test_hello():
-            pytest.fail("hello", pytrace=False)
-        def teardown_function(function):
-            pytest.fail("world", pytrace=False)
-    """
+
+    def test_hello():
+        pytest.fail("hello", pytrace=False)
+
+    def teardown_function(function):
+        pytest.fail("world", pytrace=False)
+
+    record = run_tests(
+        test_hello, teardown_function, rootpath=tmp_path, capture_output=True
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["world", "hello"])
-    result.stdout.no_fnmatch_line("*def teardown_function*")
+    # the call fails and the teardown errors
+    record.assert_outcomes(failed=1, errors=1)
+    # errors are summarized before failures, hence "world" before "hello"
+    record.stdout.fnmatch_lines(["world", "hello"])
+    record.stdout.no_fnmatch_line("*def teardown_function*")
 
 
+# ensemble: the failure happens while the test module is imported, and an
+# ensemble module is built in memory rather than imported.
 def test_pytest_fail_notrace_collection(pytester: Pytester) -> None:
     """Test pytest.fail(..., pytrace=False) does not show tracebacks during collection."""
     pytester.makepyfile(
@@ -741,24 +776,23 @@ def test_pytest_fail_notrace_collection(pytester: Pytester) -> None:
     result.stdout.no_fnmatch_line("*def some_internal_function()*")
 
 
-def test_pytest_fail_notrace_non_ascii(pytester: Pytester) -> None:
+def test_pytest_fail_notrace_non_ascii(tmp_path: Path) -> None:
     """Fix pytest.fail with pytrace=False with non-ascii characters (#1178).
 
     This tests with native and unicode strings containing non-ascii chars.
     """
-    pytester.makepyfile(
-        """\
-        import pytest
 
-        def test_hello():
-            pytest.fail('oh oh: ☺', pytrace=False)
-        """
-    )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["*test_hello*", "oh oh: ☺"])
-    result.stdout.no_fnmatch_line("*def test_hello*")
+    def test_hello():
+        pytest.fail("oh oh: ☺", pytrace=False)
+
+    record = run_tests(test_hello, rootpath=tmp_path, capture_output=True)
+    record.assert_outcomes(failed=1)
+    record.stdout.fnmatch_lines(["*test_hello*", "oh oh: ☺"])
+    record.stdout.no_fnmatch_line("*def test_hello*")
 
 
+# ensemble: entirely about the exit status of a run, which is computed by
+# ``wrap_session`` from a session an ensemble does not have.
 def test_pytest_no_tests_collected_exit_status(pytester: Pytester) -> None:
     result = pytester.runpytest()
     result.stdout.fnmatch_lines(["*collected 0 items*"])
@@ -840,6 +874,7 @@ class TestImportOrSkipExcType:
                 "TestImportOrSkipExcType_test_module_not_found_skips_without_warning"
             )
 
+    # ensemble: needs a real importable module on sys.path that raises on import.
     def test_import_error_is_propagated_by_default(self, pytester: Pytester) -> None:
         fn = pytester.makepyfile("raise ImportError('some specific problem')")
         pytester.syspathinsert()
@@ -847,6 +882,7 @@ class TestImportOrSkipExcType:
         with pytest.raises(ImportError, match="some specific problem"):
             pytest.importorskip(fn.stem)
 
+    # ensemble: needs a real importable module on sys.path that raises on import.
     def test_import_error_can_be_captured_explicitly(self, pytester: Pytester) -> None:
         fn = pytester.makepyfile("raise ImportError('some specific problem')")
         pytester.syspathinsert()
@@ -854,6 +890,7 @@ class TestImportOrSkipExcType:
         with pytest.raises(pytest.skip.Exception):
             pytest.importorskip(fn.stem, exc_type=ImportError)
 
+    # ensemble: needs a second, real module whose import raises ImportError.
     def test_import_error_integration(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             """
@@ -887,6 +924,8 @@ def test_importorskip_dev_module(monkeypatch) -> None:
         assert False, f"spurious skip: {ExceptionInfo.from_current()}"
 
 
+# ensemble: the skip is raised while the test module is imported, which is what
+# turns it into a collection-level skip; an ensemble module is already built.
 def test_importorskip_module_level(pytester: Pytester) -> None:
     """`importorskip` must be able to skip entire modules when used at module level."""
     pytester.makepyfile(
@@ -902,6 +941,7 @@ def test_importorskip_module_level(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["*collected 0 items / 1 skipped*"])
 
 
+# ensemble: as above, a module level skip raised during import.
 def test_importorskip_custom_reason(pytester: Pytester) -> None:
     """Make sure custom reasons are used."""
     pytester.makepyfile(
@@ -918,6 +958,7 @@ def test_importorskip_custom_reason(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["*collected 0 items / 1 skipped*"])
 
 
+# ensemble: runs pytest in a subprocess.
 def test_pytest_cmdline_main(pytester: Pytester) -> None:
     p = pytester.makepyfile(
         """
@@ -936,6 +977,9 @@ def test_pytest_cmdline_main(pytester: Pytester) -> None:
     assert ret == 0
 
 
+# ensemble: the subject is writing a non-ascii longrepr to the *real* output
+# stream and its encoding. An ensemble renders into a StringIO, where a
+# UnicodeEncodeError can never happen, so the ported test would be vacuous.
 def test_unicode_in_longrepr(pytester: Pytester) -> None:
     pytester.makeconftest(
         """\
@@ -959,34 +1003,37 @@ def test_unicode_in_longrepr(pytester: Pytester) -> None:
     assert "UnicodeEncodeError" not in result.stderr.str()
 
 
-def test_failure_in_setup(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def setup_module():
-            0/0
-        def test_func():
-            pass
-    """
-    )
-    result = pytester.runpytest("--tb=line")
-    result.stdout.no_fnmatch_line("*def setup_module*")
+def test_failure_in_setup(tmp_path: Path) -> None:
+    def setup_module():
+        raise ZeroDivisionError
+
+    def test_func(): ...
+
+    # ``--tb`` is a terminal plugin option, so this needs the rendering config
+    spec = ConfigSpec(rootpath=tmp_path, args=("--tb=line",))
+    record = run_tests(setup_module, test_func, spec=spec, capture_output=True)
+    # the xunit setup failure is a setup phase error
+    record.assert_outcomes(errors=1)
+    record.stdout.no_fnmatch_line("*def setup_module*")
 
 
-def test_makereport_getsource(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_foo():
-            if False: pass
-            else: assert False
-    """
-    )
-    result = pytester.runpytest()
-    result.stdout.no_fnmatch_line("*INTERNALERROR*")
-    result.stdout.fnmatch_lines(["*else: assert False*"])
+def test_makereport_getsource(tmp_path: Path) -> None:
+    # the assertion below matches the rendered source line verbatim, so this
+    # block is kept off the formatter
+    # fmt: off
+    def test_foo():
+        if False: pass  # type: ignore[unreachable]  # noqa: E701
+        else: assert False  # noqa: E701
+    # fmt: on
+
+    record = run_tests(test_foo, rootpath=tmp_path, capture_output=True)
+    record.assert_outcomes(failed=1)
+    record.stdout.no_fnmatch_line("*INTERNALERROR*")
+    record.stdout.fnmatch_lines(["*else: assert False*"])
 
 
 def test_makereport_getsource_dynamic_code(
-    pytester: Pytester, monkeypatch: MonkeyPatch
+    tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     """Test that exception in dynamically generated code doesn't break getting the source line."""
     import inspect
@@ -1001,21 +1048,18 @@ def test_makereport_getsource_dynamic_code(
 
     monkeypatch.setattr(inspect, "findsource", findsource)
 
-    pytester.makepyfile(
-        """
-        import pytest
+    @pytest.fixture
+    def foo(missing): ...
 
-        @pytest.fixture
-        def foo(missing):
-            pass
+    def test_fix(foo):
+        assert False
 
-        def test_fix(foo):
-            assert False
-    """
-    )
-    result = pytester.runpytest("-vv")
-    result.stdout.no_fnmatch_line("*INTERNALERROR*")
-    result.stdout.fnmatch_lines(["*test_fix*", "*fixture*'missing'*not found*"])
+    spec = ConfigSpec(rootpath=tmp_path, args=("-vv",))
+    record = run_tests(foo, test_fix, spec=spec, capture_output=True)
+    # the fixture is missing, so setup errors rather than the call failing
+    record.assert_outcomes(errors=1)
+    record.stdout.no_fnmatch_line("*INTERNALERROR*")
+    record.stdout.fnmatch_lines(["*test_fix*", "*fixture*'missing'*not found*"])
 
 
 def test_store_except_info_on_error() -> None:
@@ -1054,67 +1098,60 @@ def test_store_except_info_on_error() -> None:
     assert not hasattr(sys, "last_traceback")
 
 
-def test_current_test_env_var(pytester: Pytester, monkeypatch: MonkeyPatch) -> None:
+def test_current_test_env_var(tmp_path: Path) -> None:
+    # the smuggling through a ``sys`` attribute the original needed to get the
+    # values out of a separately imported module is a plain closure here
     pytest_current_test_vars: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        sys, "pytest_current_test_vars", pytest_current_test_vars, raising=False
-    )
-    pytester.makepyfile(
-        """
-        import pytest
-        import sys
-        import os
 
-        @pytest.fixture
-        def fix():
-            sys.pytest_current_test_vars.append(('setup', os.environ['PYTEST_CURRENT_TEST']))
-            yield
-            sys.pytest_current_test_vars.append(('teardown', os.environ['PYTEST_CURRENT_TEST']))
+    @pytest.fixture
+    def fix():
+        pytest_current_test_vars.append(("setup", os.environ["PYTEST_CURRENT_TEST"]))
+        yield
+        pytest_current_test_vars.append(("teardown", os.environ["PYTEST_CURRENT_TEST"]))
 
-        def test(fix):
-            sys.pytest_current_test_vars.append(('call', os.environ['PYTEST_CURRENT_TEST']))
-    """
-    )
-    result = pytester.runpytest_inprocess()
-    assert result.ret == 0
-    test_id = "test_current_test_env_var.py::test"
+    def test(fix):
+        pytest_current_test_vars.append(("call", os.environ["PYTEST_CURRENT_TEST"]))
+
+    record = run_tests(fix, test, rootpath=tmp_path)
+    record.assert_outcomes(passed=1)
+    test_id = "test_ensemble.py::test"
     assert pytest_current_test_vars == [
         ("setup", test_id + " (setup)"),
         ("call", test_id + " (call)"),
         ("teardown", test_id + " (teardown)"),
     ]
+    # the inner run deletes the variable outright when the item is done, so it
+    # is gone even though the host run set it for this very test
     assert "PYTEST_CURRENT_TEST" not in os.environ
 
 
 class TestReportContents:
     """Test user-level API of ``TestReport`` objects."""
 
-    def getrunner(self):
+    def getrunner(self) -> ProtocolRunner:
         return lambda item: runner.runtestprotocol(item, log=False)
 
-    def test_longreprtext_pass(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            def test_func():
-                pass
-        """
-        )
+    def test_longreprtext_pass(self, tmp_path: Path) -> None:
+        def test_func(): ...
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert rep.longreprtext == ""
 
-    def test_longreprtext_skip(self, pytester: Pytester) -> None:
+    def test_longreprtext_skip(self, tmp_path: Path) -> None:
         """TestReport.longreprtext can handle non-str ``longrepr`` attributes (#7559)"""
-        reports = pytester.runitem(
-            """
-            import pytest
-            def test_func():
-                pytest.skip()
-            """
-        )
+
+        def test_func():
+            pytest.skip()
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         _, call_rep, _ = reports
         assert isinstance(call_rep.longrepr, tuple)
         assert "Skipped" in call_rep.longreprtext
 
+    # ensemble: the skip is raised while the module is imported, and an ensemble
+    # module is built in memory instead of imported, so there is no collect
+    # report to carry it.
     def test_longreprtext_collect_skip(self, pytester: Pytester) -> None:
         """CollectReport.longreprtext can handle non-str ``longrepr`` attributes (#7559)"""
         pytester.makepyfile(
@@ -1129,17 +1166,17 @@ class TestReportContents:
         assert isinstance(call.report.longrepr, tuple)
         assert "Skipped" in call.report.longreprtext
 
-    def test_longreprtext_failure(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            def test_func():
-                x = 1
-                assert x == 4
-        """
-        )
+    def test_longreprtext_failure(self, tmp_path: Path) -> None:
+        def test_func():
+            x = 1
+            assert x == 4
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert "assert 1 == 4" in rep.longreprtext
 
+    # ensemble: the subject is the captured stdout/stderr on the reports, and
+    # the capture plugin is not loaded inside an ensemble.
     def test_captured_text(self, pytester: Pytester) -> None:
         reports = pytester.runitem(
             """
@@ -1170,6 +1207,8 @@ class TestReportContents:
         assert call.capstderr == "setup: stderr\ncall: stderr\n"
         assert teardown.capstderr == "setup: stderr\ncall: stderr\nteardown: stderr\n"
 
+    # ensemble: without the capture plugin ``capstdout``/``capstderr`` are empty
+    # no matter what the test does, so a ported version would assert nothing.
     def test_no_captured_text(self, pytester: Pytester) -> None:
         reports = pytester.runitem(
             """
@@ -1181,14 +1220,11 @@ class TestReportContents:
         assert rep.capstdout == ""
         assert rep.capstderr == ""
 
-    def test_longrepr_type(self, pytester: Pytester) -> None:
-        reports = pytester.runitem(
-            """
-            import pytest
-            def test_func():
-                pytest.fail(pytrace=False)
-        """
-        )
+    def test_longrepr_type(self, tmp_path: Path) -> None:
+        def test_func():
+            pytest.fail(pytrace=False)
+
+        reports = runitem(self.getrunner, tmp_path, test_func)
         rep = reports[1]
         assert isinstance(rep.longrepr, ExceptionChainRepr)
 
@@ -1208,6 +1244,8 @@ def test_outcome_exception_bad_msg() -> None:
     assert str(excinfo.value) == expected
 
 
+# ensemble: ``PYTEST_VERSION`` is set and restored around ``main()``, which an
+# ensemble never goes through - it builds its config directly.
 def test_pytest_version_env_var(pytester: Pytester, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("PYTEST_VERSION", "old version")
     pytester.makepyfile(
@@ -1225,6 +1263,10 @@ def test_pytest_version_env_var(pytester: Pytester, monkeypatch: MonkeyPatch) ->
     assert os.environ["PYTEST_VERSION"] == "old version"
 
 
+# ensemble: the subject is the session bailing out mid-run on ``--maxfail`` and
+# tearing higher scoped fixtures down against the last item. ``run_items``
+# drives ``pytest_runtest_protocol`` per item without the ``shouldstop`` /
+# ``shouldfail`` handling ``pytest_runtestloop`` does, so nothing bails.
 def test_teardown_session_failed(pytester: Pytester) -> None:
     """Test that higher-scoped fixture teardowns run in the context of the last
     item after the test session bails early due to --maxfail.
@@ -1250,6 +1292,8 @@ def test_teardown_session_failed(pytester: Pytester) -> None:
     result.assert_outcomes(failed=1, errors=1)
 
 
+# ensemble: as above, plus ``--stepwise``, whose plugin (and the cache it needs)
+# an ensemble config does not load.
 def test_teardown_session_stopped(pytester: Pytester) -> None:
     """Test that higher-scoped fixture teardowns run in the context of the last
     item after the test session bails early due to --stepwise.

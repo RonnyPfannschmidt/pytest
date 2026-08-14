@@ -46,6 +46,14 @@ def rewrite(src: str) -> ast.Module:
     return tree
 
 
+def _assertion_message(exc: BaseException) -> str:
+    """Render a raised ``AssertionError`` the way a failure report would."""
+    s = str(exc)
+    if not s.startswith("assert"):
+        return "AssertionError: " + s
+    return s
+
+
 def getmsg(
     f, extra_ns: Mapping[str, object] | None = None, *, must_pass: bool = False
 ) -> str | None:
@@ -60,16 +68,53 @@ def getmsg(
     func = ns[f.__name__]
     try:
         func()  # type: ignore[operator]
-    except AssertionError:
+    except AssertionError as exc:
         if must_pass:
             pytest.fail("shouldn't have raised")
-        s = str(sys.exc_info()[1])
-        if not s.startswith("assert"):
-            return "AssertionError: " + s
-        return s
+        return _assertion_message(exc)
     else:
         if not must_pass:
             pytest.fail("function didn't raise at all")
+        return None
+
+
+def getmsg_src(
+    src: str,
+    extra_ns: Mapping[str, object] | None = None,
+    *,
+    must_pass: bool = False,
+) -> str | None:
+    """Rewrite a whole module source, exec it, and get the failure message.
+
+    The module-level counterpart of :func:`getmsg`, for sources that need
+    module-level statements: imports, class/function definitions, a module
+    docstring (``PYTEST_DONT_REWRITE``), or a module-level ``assert``.
+
+    After the module body has run, every ``test_*`` function it defines is
+    called in definition order, in the module's own namespace -- so state the
+    rewriter leaks from one test function into the next is exercised exactly
+    as a real run would exercise it.
+
+    Returns the message of the first assertion that fails, or ``None`` when
+    ``must_pass`` is set and nothing failed.
+    """
+    src = textwrap.dedent(src)
+    code = compile(rewrite(src), "<test>", "exec")
+    ns: dict[str, object] = {}
+    if extra_ns is not None:
+        ns.update(extra_ns)
+    try:
+        exec(code, ns)
+        for name, obj in list(ns.items()):
+            if name.startswith("test_") and callable(obj):
+                obj()
+    except AssertionError as exc:
+        if must_pass:
+            pytest.fail(f"shouldn't have raised: {_assertion_message(exc)}")
+        return _assertion_message(exc)
+    else:
+        if not must_pass:
+            pytest.fail("module didn't raise at all")
         return None
 
 
@@ -346,6 +391,8 @@ class TestAssertionRewrite:
         assert isinstance(m.body[1], ast.Assert)
         assert m.body[1].msg is None
 
+    # rewriter: import hook -- PYTEST_DONT_REWRITE has to be honoured by the
+    # hook when it decides whether to rewrite a plugin module at all.
     def test_dont_rewrite_plugin(self, pytester: Pytester) -> None:
         contents = {
             "conftest.py": "pytest_plugins = 'plugin'; import plugin",
@@ -356,6 +403,7 @@ class TestAssertionRewrite:
         result = pytester.runpytest_subprocess()
         assert "warning" not in "".join(result.outlines)
 
+    # rewriter: import hook -- which files get rewritten (a plugin package).
     def test_rewrites_plugin_as_a_package(self, pytester: Pytester) -> None:
         pkgdir = pytester.mkpydir("plugin")
         pkgdir.joinpath("__init__.py").write_text(
@@ -372,6 +420,7 @@ class TestAssertionRewrite:
         result = pytester.runpytest()
         result.stdout.fnmatch_lines(["*assert 1 == 2*"])
 
+    # rewriter: module import semantics -- PEP 235 case sensitivity on import.
     def test_honors_pep_235(self, pytester: Pytester, monkeypatch) -> None:
         # note: couldn't make it fail on macos with a single `sys.path` entry
         # note: these modules are named `test_*` to trigger rewriting
@@ -477,73 +526,46 @@ class TestAssertionRewrite:
 
         assert getmsg(f) == "AssertionError: something bad!\nassert False"
 
-    def test_assertion_message(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert 1 == 2, "The failure message"
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(
-            ["*AssertionError*The failure message*", "*assert 1 == 2*"]
+    def test_assertion_message(self) -> None:
+        def test_foo():
+            assert 1 == 2, "The failure message"  # type: ignore[comparison-overlap]
+
+        assert getmsg(test_foo) == "AssertionError: The failure message\nassert 1 == 2"
+
+    def test_assertion_message_multiline(self) -> None:
+        def test_foo():
+            assert 1 == 2, "A multiline\nfailure message"  # type: ignore[comparison-overlap]
+
+        assert getmsg(test_foo) == (
+            "AssertionError: A multiline\n  failure message\nassert 1 == 2"
         )
 
-    def test_assertion_message_multiline(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert 1 == 2, "A multiline\\nfailure message"
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(
-            ["*AssertionError*A multiline*", "*failure message*", "*assert 1 == 2*"]
-        )
+    def test_assertion_message_tuple(self) -> None:
+        def test_foo():
+            assert 1 == 2, (1, 2)  # type: ignore[comparison-overlap]
 
-    def test_assertion_message_tuple(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert 1 == 2, (1, 2)
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines([f"*AssertionError*{(1, 2)!r}*", "*assert 1 == 2*"])
+        assert getmsg(test_foo) == f"AssertionError: {(1, 2)!r}\nassert 1 == 2"
 
-    def test_assertion_message_expr(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert 1 == 2, 1 + 2
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*AssertionError*3*", "*assert 1 == 2*"])
+    def test_assertion_message_expr(self) -> None:
+        def test_foo():
+            assert 1 == 2, 1 + 2  # type: ignore[comparison-overlap]
 
-    def test_assertion_message_escape(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """
-            def test_foo():
-                assert 1 == 2, 'To be escaped: %'
-        """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(
-            ["*AssertionError: To be escaped: %", "*assert 1 == 2"]
-        )
+        assert getmsg(test_foo) == "AssertionError: 3\nassert 1 == 2"
 
-    def test_assertion_messages_bytes(self, pytester: Pytester) -> None:
-        pytester.makepyfile("def test_bytes_assertion():\n    assert False, b'ohai!'\n")
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*AssertionError: b'ohai!'", "*assert False"])
+    def test_assertion_message_escape(self) -> None:
+        def test_foo():
+            assert 1 == 2, "To be escaped: %"  # type: ignore[comparison-overlap]
 
+        assert getmsg(test_foo) == "AssertionError: To be escaped: %\nassert 1 == 2"
+
+    def test_assertion_messages_bytes(self) -> None:
+        def test_bytes_assertion():
+            assert False, b"ohai!"  # noqa: RUF040
+
+        assert getmsg(test_bytes_assertion) == "AssertionError: b'ohai!'\nassert False"
+
+    # rewriter: config plumbing -- the abbreviation threshold comes from the
+    # session config via ``util._config``, so a real run is what is under test.
     def test_assertion_message_verbosity(self, pytester: Pytester) -> None:
         """
         Obey verbosity levels when printing the "message" part of assertions, when they are
@@ -572,6 +594,7 @@ class TestAssertionRewrite:
         assert result.ret == 1
         result.stdout.re_match_lines([r".*AssertionError: A+$", ".*assert False"])
 
+    # rewriter: config plumbing -- same as above, `-vv` must reach the rewriter.
     def test_assertion_message_verbosity_collection(self, pytester: Pytester) -> None:
         """
         With -vv, the "message" part of assertions must not elide collection
@@ -734,8 +757,8 @@ class TestAssertionRewrite:
 
         assert getmsg(f2) == "assert (False or (4 % 2))"
 
-    def test_at_operator_issue1290(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_at_operator_issue1290(self) -> None:
+        getmsg_src(
             """
             class Matrix(object):
                 def __init__(self, num):
@@ -744,21 +767,20 @@ class TestAssertionRewrite:
                     return self.num * other.num
 
             def test_multmat_operator():
-                assert Matrix(2) @ Matrix(3) == 6"""
+                assert Matrix(2) @ Matrix(3) == 6
+            """,
+            must_pass=True,
         )
-        pytester.runpytest().assert_outcomes(passed=1)
 
-    def test_starred_with_side_effect(self, pytester: Pytester) -> None:
+    def test_starred_with_side_effect(self) -> None:
         """See #4412"""
-        pytester.makepyfile(
-            """\
-            def test():
-                f = lambda x: x
-                x = iter([1, 2, 3])
-                assert 2 * next(x) == f(*[next(x)])
-            """
-        )
-        pytester.runpytest().assert_outcomes(passed=1)
+
+        def test() -> None:
+            f = lambda x: x  # noqa: E731
+            x = iter([1, 2, 3])
+            assert 2 * next(x) == f(*[next(x)])
+
+        getmsg(test, must_pass=True)
 
     def test_call(self) -> None:
         def g(a=42, *args, **kwargs) -> bool:
@@ -938,8 +960,8 @@ class TestAssertionRewrite:
         assert msg is not None
         assert "<MY42 object> < 0" in msg
 
-    def test_assert_handling_raise_in__iter__(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assert_handling_raise_in__iter__(self) -> None:
+        msg = getmsg_src(
             """\
             class A:
                 def __iter__(self):
@@ -954,8 +976,8 @@ class TestAssertionRewrite:
             assert A() == A()
             """
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["*E*assert <A object> == <A object>"])
+        assert msg is not None
+        assert msg.splitlines()[0] == "assert <A object> == <A object>"
 
     def test_formatchar(self) -> None:
         def f() -> None:
@@ -997,25 +1019,27 @@ class TestAssertionRewrite:
         assert "UnicodeDecodeError" not in msg
         assert "UnicodeEncodeError" not in msg
 
-    def test_assert_fixture(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assert_fixture(self) -> None:
+        msg = getmsg_src(
             """\
-        import pytest
-        @pytest.fixture
-        def fixt():
-            return 42
+            import pytest
+            @pytest.fixture
+            def fixt():
+                return 42
 
-        def test_something():  # missing "fixt" argument
-            assert fixt == 42
+            def test_something():  # missing "fixt" argument
+                assert fixt == 42
             """
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(
-            ["*assert <pytest_fixture(<function fixt at *>)> == 42*"]
+        assert msg is not None
+        assert re.fullmatch(
+            r"assert <pytest_fixture\(<function fixt at 0x[0-9a-fA-F]+>\)> == 42", msg
         )
 
 
 class TestRewriteOnImport:
+    # rewriter: import hook and .pyc caching throughout -- every test here needs
+    # a real file imported through AssertionRewritingHook.
     def test_pycache_is_a_file(self, pytester: Pytester) -> None:
         pytester.path.joinpath("__pycache__").write_text("Hello", encoding="utf-8")
         pytester.makepyfile(
@@ -1309,6 +1333,7 @@ def test_rewritten():
 
 
 class TestAssertionRewriteHookDetails:
+    # rewriter: import hook / .pyc caching / module import semantics throughout.
     def test_sys_meta_path_munged(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             """
@@ -1504,58 +1529,61 @@ class TestAssertionRewriteHookDetails:
         result.stdout.fnmatch_lines(["*1 passed*"])
 
 
-def test_issue731(pytester: Pytester) -> None:
-    pytester.makepyfile(
+def test_issue731() -> None:
+    # Braces in a custom repr must not unbalance the mini format language that
+    # ``_format_explanation`` speaks; if they did, formatting the message would
+    # blow up (historically reported as "unbalanced braces").
+    msg = getmsg_src(
         """
-    class LongReprWithBraces(object):
-        def __repr__(self):
-           return 'LongReprWithBraces({' + ('a' * 80) + '}' + ('a' * 120) + ')'
+        class LongReprWithBraces(object):
+            def __repr__(self):
+               return 'LongReprWithBraces({' + ('a' * 80) + '}' + ('a' * 120) + ')'
 
-        def some_method(self):
-            return False
+            def some_method(self):
+                return False
 
-    def test_long_repr():
-        obj = LongReprWithBraces()
-        assert obj.some_method()
-    """
+        def test_long_repr():
+            obj = LongReprWithBraces()
+            assert obj.some_method()
+        """
     )
-    result = pytester.runpytest()
-    result.stdout.no_fnmatch_line("*unbalanced braces*")
+    assert msg is not None
+    assert "unbalanced braces" not in msg
+    assert msg.splitlines()[:2] == ["assert False", " +  where False = some_method()"]
 
 
 class TestIssue925:
-    def test_simple_case(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_simple_case(self) -> None:
+        msg = getmsg_src(
             """
-        def test_ternary_display():
-            assert (False == False) == False
-        """
-        )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["*E*assert (False == False) == False"])
-
-    def test_long_case(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+            def test_ternary_display():
+                assert (False == False) == False
             """
-        def test_ternary_display():
-             assert False == (False == True) == True
-        """
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["*E*assert (False == True) == True"])
+        assert msg == "assert (False == False) == False"
 
-    def test_many_brackets(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_long_case(self) -> None:
+        msg = getmsg_src(
+            """
+            def test_ternary_display():
+                 assert False == (False == True) == True
+            """
+        )
+        assert msg == "assert (False == True) == True"
+
+    def test_many_brackets(self) -> None:
+        msg = getmsg_src(
             """
             def test_ternary_display():
                  assert True == ((False == True) == True)
             """
         )
-        result = pytester.runpytest()
-        result.stdout.fnmatch_lines(["*E*assert True == ((False == True) == True)"])
+        assert msg == "assert True == ((False == True) == True)"
 
 
 class TestIssue2121:
+    # rewriter: import hook -- the subject is which files a ``python_files``
+    # pattern with subdirectories causes to be rewritten on import.
     def test_rewrite_python_files_contain_subdirs(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             **{
@@ -1578,8 +1606,8 @@ class TestIssue2121:
 class TestAssertionRewriteWalrusOperator:
     """See #10743"""
 
-    def test_assertion_walrus_operator(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator(self) -> None:
+        getmsg_src(
             """
             def my_func(before, after):
                 return before == after
@@ -1591,13 +1619,12 @@ class TestAssertionRewriteWalrusOperator:
                 a = "Hello"
                 assert not my_func(a, a := change_value(a))
                 assert a == "hello"
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_dont_rewrite(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_dont_rewrite(self) -> None:
+        getmsg_src(
             """
             'PYTEST_DONT_REWRITE'
             def my_func(before, after):
@@ -1610,13 +1637,12 @@ class TestAssertionRewriteWalrusOperator:
                 a = "Hello"
                 assert not my_func(a, a := change_value(a))
                 assert a == "hello"
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_inline_walrus_operator(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_inline_walrus_operator(self) -> None:
+        getmsg_src(
             """
             def my_func(before, after):
                 return before == after
@@ -1625,13 +1651,12 @@ class TestAssertionRewriteWalrusOperator:
                 a = "Hello"
                 assert not my_func(a, a := a.lower())
                 assert a == "hello"
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_inline_walrus_operator_reverse(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_inline_walrus_operator_reverse(self) -> None:
+        getmsg_src(
             """
             def my_func(before, after):
                 return before == after
@@ -1640,97 +1665,83 @@ class TestAssertionRewriteWalrusOperator:
                 a = "Hello"
                 assert my_func(a := a.lower(), a)
                 assert a == 'hello'
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_no_variable_name_conflict(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_no_variable_name_conflict(self) -> None:
+        msg = getmsg_src(
             """
             def test_walrus_conversion_no_conflict():
                 a = "Hello"
                 assert a == (b := a.lower())
-        """
+            """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*AssertionError: assert 'Hello' == 'hello'"])
+        assert msg is not None
+        # remaining lines are the string diff `util._reprcompare` appends
+        assert msg.splitlines()[0] == "assert 'Hello' == 'hello'"
 
     def test_assertion_walrus_operator_true_assertion_and_changes_variable_value(
-        self, pytester: Pytester
+        self,
     ) -> None:
-        pytester.makepyfile(
+        getmsg_src(
             """
             def test_walrus_conversion_succeed():
                 a = "Hello"
                 assert a != (a := a.lower())
                 assert a == 'hello'
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_fail_assertion(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_fail_assertion(self) -> None:
+        msg = getmsg_src(
             """
             def test_walrus_conversion_fails():
                 a = "Hello"
                 assert a == (a := a.lower())
-        """
+            """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*AssertionError: assert 'Hello' == 'hello'"])
+        assert msg is not None
+        assert msg.splitlines()[0] == "assert 'Hello' == 'hello'"
 
-    def test_assertion_walrus_operator_boolean_composite(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_boolean_composite(self) -> None:
+        getmsg_src(
             """
             def test_walrus_operator_change_boolean_value():
                 a = True
                 assert a and True and ((a := False) is False) and (a is False) and ((a := None) is None)
                 assert a is None
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_compare_boolean_fails(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_compare_boolean_fails(self) -> None:
+        msg = getmsg_src(
             """
             def test_walrus_operator_change_boolean_value():
                 a = True
                 assert not (a and ((a := False) is False))
-        """
+            """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*assert not (True and False is False)"])
+        assert msg == "assert not (True and False is False)"
 
-    def test_assertion_walrus_operator_boolean_none_fails(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_boolean_none_fails(self) -> None:
+        msg = getmsg_src(
             """
             def test_walrus_operator_change_boolean_value():
                 a = True
                 assert not (a and ((a := None) is None))
-        """
+            """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*assert not (True and None is None)"])
+        assert msg == "assert not (True and None is None)"
 
     def test_assertion_walrus_operator_value_changes_cleared_after_each_test(
-        self, pytester: Pytester
+        self,
     ) -> None:
-        pytester.makepyfile(
+        # ``getmsg_src`` calls both ``test_*`` functions in the same namespace,
+        # which is what makes the leak from the first into the second visible.
+        getmsg_src(
             """
             def test_walrus_operator_change_value():
                 a = True
@@ -1739,15 +1750,12 @@ class TestAssertionRewriteWalrusOperator:
             def test_walrus_operator_not_override_value():
                 a = True
                 assert a is True
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_namedexpr_compare_left_overwrite(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_namedexpr_compare_left_overwrite(self) -> None:
+        msg = getmsg_src(
             """
             def test_namedexpr_compare_left_overwrite():
                 a = "Hello"
@@ -1756,105 +1764,91 @@ class TestAssertionRewriteWalrusOperator:
                 assert (a := b) == c and (a := "Test") == "Test"
             """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*assert ('World' == 'Test'*"])
+        assert msg is not None
+        assert msg.splitlines()[0] == "assert ('World' == 'Test'"
 
 
 class TestIssue11028:
-    def test_assertion_walrus_operator_in_operand(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_in_operand(self) -> None:
+        getmsg_src(
             """
             def test_in_string():
               assert (obj := "foo") in obj
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_in_operand_json_dumps(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_in_operand_json_dumps(self) -> None:
+        getmsg_src(
             """
             import json
 
             def test_json_encoder():
                 assert (obj := "foo") in json.dumps(obj)
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_equals_operand_function(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_equals_operand_function(self) -> None:
+        getmsg_src(
             """
             def f(a):
                 return a
 
             def test_call_other_function_arg():
               assert (obj := "foo") == f(obj)
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
     def test_assertion_walrus_operator_equals_operand_function_keyword_arg(
-        self, pytester: Pytester
+        self,
     ) -> None:
-        pytester.makepyfile(
+        getmsg_src(
             """
             def f(a='test'):
                 return a
 
             def test_call_other_function_k_arg():
               assert (obj := "foo") == f(a=obj)
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
     def test_assertion_walrus_operator_equals_operand_function_arg_as_function(
-        self, pytester: Pytester
+        self,
     ) -> None:
-        pytester.makepyfile(
+        getmsg_src(
             """
             def f(a='test'):
                 return a
 
             def test_function_of_function():
               assert (obj := "foo") == f(f(obj))
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
-    def test_assertion_walrus_operator_gt_operand_function(
-        self, pytester: Pytester
-    ) -> None:
-        pytester.makepyfile(
+    def test_assertion_walrus_operator_gt_operand_function(self) -> None:
+        msg = getmsg_src(
             """
             def add_one(a):
                 return a + 1
 
             def test_gt():
               assert (obj := 4) > add_one(obj)
-        """
+            """
         )
-        result = pytester.runpytest()
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*assert 4 > 5", "*where 5 = add_one(4)"])
+        assert msg == "assert 4 > 5\n +  where 5 = add_one(4)"
 
 
 class TestIssue11239:
-    def test_assertion_walrus_different_test_cases(self, pytester: Pytester) -> None:
+    def test_assertion_walrus_different_test_cases(self) -> None:
         """Regression for (#11239)
 
         Walrus operator rewriting would leak to separate test cases if they used the same variables.
         """
-        pytester.makepyfile(
+        getmsg_src(
             """
             def test_1():
                 state = {"x": 2}.get("x")
@@ -1863,16 +1857,16 @@ class TestIssue11239:
             def test_2():
                 db = {"x": 2}
                 assert (state := db.get("x")) is not None
-        """
+            """,
+            must_pass=True,
         )
-        result = pytester.runpytest()
-        assert result.ret == 0
 
 
 @pytest.mark.skipif(
     sys.maxsize <= (2**31 - 1), reason="Causes OverflowError on 32bit systems"
 )
 @pytest.mark.parametrize("offset", [-1, +1])
+# rewriter: .pyc caching -- the mtime written into the pyc header.
 def test_source_mtime_long_long(pytester: Pytester, offset) -> None:
     """Support modification dates after 2038 in rewritten files (#4903).
 
@@ -1895,6 +1889,7 @@ def test_source_mtime_long_long(pytester: Pytester, offset) -> None:
     assert result.ret == 0
 
 
+# rewriter: import hook -- reentrancy of the hook while writing a pyc.
 def test_rewrite_infinite_recursion(
     pytester: Pytester, pytestconfig, monkeypatch
 ) -> None:
@@ -1930,6 +1925,7 @@ def test_rewrite_infinite_recursion(
 
 
 class TestEarlyRewriteBailout:
+    # rewriter: import hook -- which modules find_spec is even called for.
     @pytest.fixture
     def hook(
         self, pytestconfig, monkeypatch, pytester: Pytester
@@ -2045,6 +2041,9 @@ class TestEarlyRewriteBailout:
 
 
 class TestAssertionPass:
+    # rewriter: config plumbing -- the `enable_assertion_pass_hook` ini has to
+    # reach the rewriter, and a registered pytest_assertion_pass hookimpl has to
+    # reach util._assertion_pass. Both are session state, not rewriter output.
     def test_option_default(self, pytester: Pytester) -> None:
         config = pytester.parseconfig()
         assert config.getini("enable_assertion_pass_hook") is False
@@ -2304,6 +2303,7 @@ class TestPyCacheDir:
 
         assert get_cache_dir(Path(source)) == Path(expected)
 
+    # rewriter: .pyc caching -- where the rewritten pyc lands on disk.
     def test_sys_pycache_prefix_integration(
         self, tmp_path, monkeypatch, pytester: Pytester
     ) -> None:
@@ -2367,6 +2367,8 @@ class TestReprSizeVerbosity:
     def test_get_maxsize_for_saferepr_no_config(self) -> None:
         assert _get_maxsize_for_saferepr(None) == DEFAULT_REPR_MAX_SIZE
 
+    # rewriter: config plumbing -- the three tests below check that -v/-vv reach
+    # `util._config`, which is what `_saferepr` reads its maxsize from.
     def create_test_file(self, pytester: Pytester, size: int) -> None:
         pytester.makepyfile(
             f"""
@@ -2393,17 +2395,13 @@ class TestReprSizeVerbosity:
 
 
 class TestIssue11140:
-    def test_constant_not_picked_as_module_docstring(self, pytester: Pytester) -> None:
-        pytester.makepyfile(
-            """\
-            0
-
-            def test_foo():
-                pass
-            """
-        )
-        result = pytester.runpytest()
-        assert result.ret == 0
+    def test_constant_not_picked_as_module_docstring(self) -> None:
+        src = "0\n\ndef test_foo():\n    pass\n"
+        # A non-string leading constant is not a docstring, so the rewriter must
+        # neither read it as one nor place its imports after it.
+        m = rewrite(src)
+        assert isinstance(m.body[0], ast.Import)
+        getmsg_src(src, must_pass=True)
 
 
 class TestSafereprUnbounded:
@@ -2429,6 +2427,7 @@ class TestSafereprUnbounded:
         )
 
 
+# rewriter: plugin machinery -- the subject is a full run with a plugin disabled.
 def test_assertion_failure_when_terminalreporter_is_disabled(
     pytester: Pytester,
 ) -> None:

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from collections.abc import Generator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from datetime import datetime
 from datetime import timezone
 import os
@@ -13,6 +17,14 @@ from xml.dom import minidom
 import xmlschema
 
 from _pytest.config import Config
+from _pytest.config import UsageError
+from _pytest.ensemble import build_module
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import DEFAULT_MODULE_NAME
+from _pytest.ensemble import module_from_path
+from _pytest.ensemble import run_tests
+from _pytest.ensemble import RunRecord
+from _pytest.ensemble import Source
 from _pytest.junitxml import _JunitDurationReport
 from _pytest.junitxml import _JunitFamily
 from _pytest.junitxml import _JunitLogging
@@ -28,6 +40,11 @@ import _pytest.timing
 import pytest
 
 
+#: What ``record_property``/``record_xml_attribute``/``record_testsuite_property``
+#: hand to a test.
+RecordFunc = Callable[[str, object], None]
+
+
 @pytest.fixture(scope="session")
 def schema() -> xmlschema.XMLSchema:
     """Return an xmlschema.XMLSchema object for the junit-10.xsd file."""
@@ -37,6 +54,70 @@ def schema() -> xmlschema.XMLSchema:
 
 
 class RunAndParse:
+    """Run in-memory sources under ``junitxml`` and parse the XML it wrote.
+
+    The junit report is written from ``pytest_sessionfinish``, which for an
+    ensemble is the exit of :func:`run_tests` - so the file only exists once
+    that has returned.
+
+    ``name`` is the name of the synthesized module holding loose sources,
+    and the XML quotes it as the ``classname`` of every testcase, exactly
+    where the pytester version quoted the name of the generated file. It is
+    therefore part of what a test asserts, not an implementation detail.
+    """
+
+    def __init__(self, tmp_path: Path, schema: xmlschema.XMLSchema) -> None:
+        self.tmp_path = tmp_path
+        self.schema = schema
+        self.xml_path = tmp_path.joinpath("junit.xml")
+
+    def __call__(
+        self,
+        *sources: Source,
+        name: str = DEFAULT_MODULE_NAME,
+        args: Sequence[str] = (),
+        inicfg: Mapping[str, object] | None = None,
+        family: _JunitFamily | None = "xunit1",
+        suite_name: str = "pytest",
+    ) -> tuple[RunRecord, DomDocument]:
+        argv = tuple(args)
+        if family:
+            argv = ("-o", "junit_family=" + family, *argv)
+        spec = ConfigSpec(
+            rootpath=self.tmp_path,
+            args=(f"--junitxml={self.xml_path}", *argv),
+            inicfg=inicfg if inicfg is not None else {},
+        ).with_plugins("junitxml")
+        record = run_tests(*sources, spec=spec, name=name)
+        if family == "xunit2":
+            with self.xml_path.open(encoding="utf-8") as f:
+                self.schema.validate(f)
+        xmldoc = minidom.parse(str(self.xml_path))
+        # Ensure the tests attribute of the ``<testsuite>`` element
+        # always matches the number of ``<testcase>`` elements (#3580).
+        doc = DomDocument(xmldoc)
+        testcase_nodes = doc.find_by_tag("testcase")
+        test_suite_node = doc.get_first_by_tag("testsuite")
+        test_suite_node.assert_attr(name=suite_name, tests=len(testcase_nodes))
+        return record, doc
+
+
+@pytest.fixture
+def run_and_parse(tmp_path: Path, schema: xmlschema.XMLSchema) -> RunAndParse:
+    """Fixture that returns a function that runs the given in-memory sources
+    with ``--junitxml`` and returns the run record plus the parsed
+    ``DomNode`` of the root xml node.
+
+    The ``family`` parameter is used to configure the ``junit_family`` of the written report.
+    "xunit2" is also automatically validated against the schema.
+    """
+    return RunAndParse(tmp_path, schema)
+
+
+class RunAndParsePytester:
+    """The pytester-backed original, kept for the tests that need a real
+    directory tree, a conftest, a subprocess or captured item output."""
+
     def __init__(self, pytester: Pytester, schema: xmlschema.XMLSchema) -> None:
         self.pytester = pytester
         self.schema = schema
@@ -65,14 +146,11 @@ class RunAndParse:
 
 
 @pytest.fixture
-def run_and_parse(pytester: Pytester, schema: xmlschema.XMLSchema) -> RunAndParse:
-    """Fixture that returns a function that can be used to execute pytest and
-    return the parsed ``DomNode`` of the root xml node.
-
-    The ``family`` parameter is used to configure the ``junit_family`` of the written report.
-    "xunit2" is also automatically validated against the schema.
-    """
-    return RunAndParse(pytester, schema)
+def run_and_parse_pytester(
+    pytester: Pytester, schema: xmlschema.XMLSchema
+) -> RunAndParsePytester:
+    """``run_and_parse`` for the tests that could not move to an ensemble."""
+    return RunAndParsePytester(pytester, schema)
 
 
 def assert_attr(node: minidom.Element, **kwargs: object) -> None:
@@ -210,107 +288,123 @@ parametrize_families = pytest.mark.parametrize("xunit_family", ["xunit1", "xunit
 class TestPython:
     @parametrize_families
     def test_summing_simple(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def test_pass():
-                pass
-            def test_fail():
-                assert 0
-            def test_skip():
-                pytest.skip("")
-            @pytest.mark.xfail
-            def test_xfail():
-                assert 0
-            @pytest.mark.xfail
-            def test_xpass():
-                assert 1
-        """
+        def test_pass() -> None:
+            pass
+
+        def test_fail() -> None:
+            assert 0
+
+        def test_skip() -> None:
+            pytest.skip("")
+
+        @pytest.mark.xfail
+        def test_xfail() -> None:
+            assert 0
+
+        @pytest.mark.xfail
+        def test_xpass() -> None:
+            assert 1
+
+        record, dom = run_and_parse(
+            test_pass,
+            test_fail,
+            test_skip,
+            test_xfail,
+            test_xpass,
+            family=xunit_family,
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        # `assert result.ret` only said "nonzero"; the record says which.
+        record.assert_outcomes(passed=1, failed=1, skipped=1, xfailed=1, xpassed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(name="pytest", errors=0, failures=1, skipped=2, tests=5)
 
     @parametrize_families
     def test_summing_simple_with_errors(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.fixture
-            def fixture():
-                raise Exception()
-            def test_pass():
-                pass
-            def test_fail():
-                assert 0
-            def test_error(fixture):
-                pass
-            @pytest.mark.xfail
-            def test_xfail():
-                assert False
-            @pytest.mark.xfail(strict=True)
-            def test_xpass():
-                assert True
-        """
+        @pytest.fixture
+        def fixture() -> None:
+            raise Exception()
+
+        def test_pass() -> None:
+            pass
+
+        def test_fail() -> None:
+            assert 0
+
+        def test_error(fixture: None) -> None:
+            pass
+
+        @pytest.mark.xfail
+        def test_xfail() -> None:
+            assert False
+
+        @pytest.mark.xfail(strict=True)
+        def test_xpass() -> None:
+            assert True
+
+        record, dom = run_and_parse(
+            fixture,
+            test_pass,
+            test_fail,
+            test_error,
+            test_xfail,
+            test_xpass,
+            family=xunit_family,
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        record.assert_outcomes(
+            passed=1, failed=2, errors=1, xfailed=1
+        )  # strict xpass is a failure
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(name="pytest", errors=1, failures=2, skipped=1, tests=5)
 
     @parametrize_families
     def test_hostname_in_xml(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            def test_pass():
-                pass
-        """
-        )
-        _result, dom = run_and_parse(family=xunit_family)
+        def test_pass() -> None:
+            pass
+
+        _record, dom = run_and_parse(test_pass, family=xunit_family)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(hostname=platform.node())
 
     @parametrize_families
     def test_timestamp_in_xml(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            def test_pass():
-                pass
-        """
-        )
+        def test_pass() -> None:
+            pass
+
         start_time = datetime.now(timezone.utc)
-        _result, dom = run_and_parse(family=xunit_family)
+        _record, dom = run_and_parse(test_pass, family=xunit_family)
         node = dom.get_first_by_tag("testsuite")
         timestamp = datetime.fromisoformat(node["timestamp"])
         assert start_time <= timestamp < datetime.now(timezone.utc)
 
     def test_timing_function(
         self,
-        pytester: Pytester,
         run_and_parse: RunAndParse,
         mock_timing: _pytest.timing.MockTiming,
     ) -> None:
-        pytester.makepyfile(
-            """
-            from _pytest import timing
-            def setup_module():
-                timing.sleep(1)
-            def teardown_module():
-                timing.sleep(2)
-            def test_sleep():
-                timing.sleep(4)
-        """
+        from _pytest import timing
+
+        def setup_module() -> None:
+            timing.sleep(1)
+
+        def teardown_module() -> None:
+            timing.sleep(2)
+
+        def test_sleep() -> None:
+            timing.sleep(4)
+
+        _record, dom = run_and_parse(
+            build_module(
+                "test_timing_function", setup_module, teardown_module, test_sleep
+            )
         )
-        _result, dom = run_and_parse()
         node = dom.get_first_by_tag("testsuite")
         tnode = node.get_first_by_tag("testcase")
         val = tnode["time"]
@@ -320,7 +414,6 @@ class TestPython:
     @pytest.mark.parametrize("duration_report", ["call", "total"])
     def test_junit_duration_report(
         self,
-        pytester: Pytester,
         monkeypatch: MonkeyPatch,
         duration_report: _JunitDurationReport,
         run_and_parse: RunAndParse,
@@ -335,13 +428,12 @@ class TestPython:
 
         monkeypatch.setattr(LogXML, "node_reporter", node_reporter_wrapper)
 
-        pytester.makepyfile(
-            """
-            def test_foo():
-                pass
-        """
+        def test_foo() -> None:
+            pass
+
+        _record, dom = run_and_parse(
+            test_foo, args=("-o", f"junit_duration_report={duration_report}")
         )
-        _result, dom = run_and_parse("-o", f"junit_duration_report={duration_report}")
         node = dom.get_first_by_tag("testsuite")
         tnode = node.get_first_by_tag("testcase")
         val = float(tnode["time"])
@@ -353,21 +445,20 @@ class TestPython:
 
     @parametrize_families
     def test_setup_error(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
+        @pytest.fixture
+        def arg(request: pytest.FixtureRequest) -> None:
+            raise ValueError("Error reason")
 
-            @pytest.fixture
-            def arg(request):
-                raise ValueError("Error reason")
-            def test_function(arg):
-                pass
-        """
+        def test_function(arg: None) -> None:
+            pass
+
+        record, dom = run_and_parse(
+            arg, test_function, name="test_setup_error", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        # A fixture blowing up at setup is an error, not a failure.
+        record.assert_outcomes(errors=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=1, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -378,22 +469,21 @@ class TestPython:
 
     @parametrize_families
     def test_teardown_error(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
+        @pytest.fixture
+        def arg() -> Generator[None]:
+            yield
+            raise ValueError("Error reason")
 
-            @pytest.fixture
-            def arg():
-                yield
-                raise ValueError('Error reason')
-            def test_function(arg):
-                pass
-        """
+        def test_function(arg: None) -> None:
+            pass
+
+        record, dom = run_and_parse(
+            arg, test_function, name="test_teardown_error", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        # The call passed; the teardown is what errored.
+        record.assert_outcomes(passed=1, errors=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=1, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -404,22 +494,18 @@ class TestPython:
 
     @parametrize_families
     def test_call_failure_teardown_error(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
+        @pytest.fixture
+        def arg() -> Generator[None]:
+            yield
+            raise Exception("Teardown Exception")
 
-            @pytest.fixture
-            def arg():
-                yield
-                raise Exception("Teardown Exception")
-            def test_function(arg):
-                raise Exception("Call Exception")
-        """
-        )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        def test_function(arg: None) -> None:
+            raise Exception("Call Exception")
+
+        record, dom = run_and_parse(arg, test_function, family=xunit_family)
+        record.assert_outcomes(failed=1, errors=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=1, failures=1, tests=2)
         first, second = dom.find_by_tag("testcase")
@@ -435,17 +521,15 @@ class TestPython:
 
     @parametrize_families
     def test_skip_contains_name_reason(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def test_skip():
-                pytest.skip("hello23")
-        """
+        def test_skip() -> None:
+            pytest.skip("hello23")
+
+        record, dom = run_and_parse(
+            test_skip, name="test_skip_contains_name_reason", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret == 0
+        record.assert_outcomes(skipped=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=1)
         tnode = node.get_first_by_tag("testcase")
@@ -455,18 +539,16 @@ class TestPython:
 
     @parametrize_families
     def test_mark_skip_contains_name_reason(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.mark.skip(reason="hello24")
-            def test_skip():
-                assert True
-        """
+        @pytest.mark.skip(reason="hello24")
+        def test_skip() -> None:
+            assert True
+
+        record, dom = run_and_parse(
+            test_skip, name="test_mark_skip_contains_name_reason", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret == 0
+        record.assert_outcomes(skipped=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=1)
         tnode = node.get_first_by_tag("testcase")
@@ -478,19 +560,20 @@ class TestPython:
 
     @parametrize_families
     def test_mark_skipif_contains_name_reason(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            GLOBAL_CONDITION = True
-            @pytest.mark.skipif(GLOBAL_CONDITION, reason="hello25")
-            def test_skip():
-                assert True
-        """
+        # The module global of the original is a closure variable here; the
+        # mark stores the evaluated condition either way.
+        global_condition = True
+
+        @pytest.mark.skipif(global_condition, reason="hello25")
+        def test_skip() -> None:
+            assert True
+
+        record, dom = run_and_parse(
+            test_skip, name="test_mark_skipif_contains_name_reason", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret == 0
+        record.assert_outcomes(skipped=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=1)
         tnode = node.get_first_by_tag("testcase")
@@ -500,9 +583,15 @@ class TestPython:
         snode = tnode.get_first_by_tag("skipped")
         snode.assert_attr(type="pytest.skip", message="hello25")
 
+    # ensemble: asserts that captured output is *absent*; without item-level
+    # capture in an ensemble nothing is ever captured and the assertion would
+    # hold for the wrong reason.
     @parametrize_families
     def test_mark_skip_doesnt_capture_output(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self,
+        pytester: Pytester,
+        run_and_parse_pytester: RunAndParsePytester,
+        xunit_family: _JunitFamily,
     ) -> None:
         pytester.makepyfile(
             """
@@ -512,24 +601,23 @@ class TestPython:
                 print("bar!")
         """
         )
-        result, dom = run_and_parse(family=xunit_family)
+        result, dom = run_and_parse_pytester(family=xunit_family)
         assert result.ret == 0
         node_xml = dom.get_first_by_tag("testsuite").toxml()
         assert "bar!" not in node_xml
 
     @parametrize_families
     def test_classname_instance(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            class TestClass(object):
-                def test_method(self):
-                    assert 0
-        """
+        class TestClass:
+            def test_method(self) -> None:
+                assert 0
+
+        record, dom = run_and_parse(
+            TestClass, name="test_classname_instance", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        record.assert_outcomes(failed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(failures=1)
         tnode = node.get_first_by_tag("testcase")
@@ -539,24 +627,34 @@ class TestPython:
 
     @parametrize_families
     def test_classname_nested_dir(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, tmp_path: Path, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        p = pytester.mkdir("sub").joinpath("test_hello.py")
+        # The classname comes from the nodeid, so the module has to genuinely
+        # live in a subdirectory of the rootdir: written to disk and imported
+        # with module_from_path, rather than synthesized.
+        sub = tmp_path.joinpath("sub")
+        sub.mkdir()
+        p = sub.joinpath("test_hello.py")
         p.write_text("def test_func(): 0/0", encoding="utf-8")
-        result, dom = run_and_parse(family=xunit_family)
-        assert result.ret
+        record, dom = run_and_parse(module_from_path(p), family=xunit_family)
+        record.assert_outcomes(failed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(failures=1)
         tnode = node.get_first_by_tag("testcase")
         tnode.assert_attr(classname="sub.test_hello", name="test_func")
 
+    # ensemble: an internal error is reported by wrap_session, which an
+    # ensemble does not run - the exception escapes the run instead.
     @parametrize_families
     def test_internal_error(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self,
+        pytester: Pytester,
+        run_and_parse_pytester: RunAndParsePytester,
+        xunit_family: _JunitFamily,
     ) -> None:
         pytester.makeconftest("def pytest_runtest_protocol(): 0 / 0")
         pytester.makepyfile("def test_function(): pass")
-        result, dom = run_and_parse(family=xunit_family)
+        result, dom = run_and_parse_pytester(family=xunit_family)
         assert result.ret
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=1, tests=1)
@@ -566,6 +664,9 @@ class TestPython:
         fnode.assert_attr(message="internal error")
         assert "Division" in fnode.toxml()
 
+    # ensemble: the system-out/system-err sections come from the item-level
+    # capture an ensemble has no way to start (the CaptureManager is created
+    # in pytest_load_initial_conftests, which an ensemble never runs).
     @pytest.mark.parametrize(
         "junit_logging", ["no", "log", "system-out", "system-err", "out-err", "all"]
     )
@@ -574,7 +675,7 @@ class TestPython:
         self,
         pytester: Pytester,
         junit_logging: _JunitLogging,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         xunit_family: _JunitFamily,
     ) -> None:
         pytester.makepyfile(
@@ -591,7 +692,7 @@ class TestPython:
         """
         )
 
-        result, dom = run_and_parse(
+        result, dom = run_and_parse_pytester(
             "-o", f"junit_logging={junit_logging}", family=xunit_family
         )
         assert result.ret, "Expected ret > 0"
@@ -639,24 +740,25 @@ class TestPython:
 
     @parametrize_families
     def test_failure_verbose_message(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import sys
-            def test_fail():
-                assert 0, "An error"
-        """
-        )
-        _result, dom = run_and_parse(family=xunit_family)
+        def test_fail() -> None:
+            assert 0, "An error"
+
+        record, dom = run_and_parse(test_fail, family=xunit_family)
+        record.assert_outcomes(failed=1)
         node = dom.get_first_by_tag("testsuite")
         tnode = node.get_first_by_tag("testcase")
         fnode = tnode.get_first_by_tag("failure")
         fnode.assert_attr(message="AssertionError: An error\nassert 0")
 
+    # ensemble: asserts on the captured system-out of each parametrized item.
     @parametrize_families
     def test_failure_escape(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self,
+        pytester: Pytester,
+        run_and_parse_pytester: RunAndParsePytester,
+        xunit_family: _JunitFamily,
     ) -> None:
         pytester.makepyfile(
             """
@@ -667,7 +769,7 @@ class TestPython:
                 assert 0
         """
         )
-        result, dom = run_and_parse(
+        result, dom = run_and_parse_pytester(
             "-o", "junit_logging=system-out", family=xunit_family
         )
         assert result.ret
@@ -684,19 +786,23 @@ class TestPython:
 
     @parametrize_families
     def test_junit_prefixing(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            def test_func():
-                assert 0
-            class TestHello(object):
-                def test_hello(self):
-                    pass
-        """
+        def test_func() -> None:
+            assert 0
+
+        class TestHello:
+            def test_hello(self) -> None:
+                pass
+
+        record, dom = run_and_parse(
+            test_func,
+            TestHello,
+            name="test_junit_prefixing",
+            args=("--junitprefix=xyz",),
+            family=xunit_family,
         )
-        result, dom = run_and_parse("--junitprefix=xyz", family=xunit_family)
-        assert result.ret
+        record.assert_outcomes(passed=1, failed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(failures=1, tests=2)
         tnode = node.get_first_by_tag("testcase")
@@ -708,17 +814,15 @@ class TestPython:
 
     @parametrize_families
     def test_xfailure_function(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            def test_xfail():
-                pytest.xfail("42")
-        """
+        def test_xfail() -> None:
+            pytest.xfail("42")
+
+        record, dom = run_and_parse(
+            test_xfail, name="test_xfailure_function", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert not result.ret
+        record.assert_outcomes(xfailed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=1, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -728,18 +832,16 @@ class TestPython:
 
     @parametrize_families
     def test_xfailure_marker(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.mark.xfail(reason="42")
-            def test_xfail():
-                assert False
-        """
+        @pytest.mark.xfail(reason="42")
+        def test_xfail() -> None:
+            assert False
+
+        record, dom = run_and_parse(
+            test_xfail, name="test_xfailure_marker", family=xunit_family
         )
-        result, dom = run_and_parse(family=xunit_family)
-        assert not result.ret
+        record.assert_outcomes(xfailed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=1, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -747,6 +849,7 @@ class TestPython:
         fnode = tnode.get_first_by_tag("skipped")
         fnode.assert_attr(type="pytest.xfail", message="42")
 
+    # ensemble: counts the captured output sections of an item.
     @pytest.mark.parametrize(
         "junit_logging", ["no", "log", "system-out", "system-err", "out-err", "all"]
     )
@@ -754,7 +857,7 @@ class TestPython:
         self,
         pytester: Pytester,
         junit_logging: _JunitLogging,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
     ) -> None:
         pytester.makepyfile(
             """
@@ -768,7 +871,7 @@ class TestPython:
                 assert 0
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         tnode = node.get_first_by_tag("testcase")
 
@@ -783,18 +886,16 @@ class TestPython:
 
     @parametrize_families
     def test_xfailure_xpass(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.mark.xfail
-            def test_xpass():
-                pass
-        """
+        @pytest.mark.xfail
+        def test_xpass() -> None:
+            pass
+
+        record, dom = run_and_parse(
+            test_xpass, name="test_xfailure_xpass", family=xunit_family
         )
-        _result, dom = run_and_parse(family=xunit_family)
-        # assert result.ret
+        record.assert_outcomes(xpassed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=0, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -802,18 +903,17 @@ class TestPython:
 
     @parametrize_families
     def test_xfailure_xpass_strict(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self, run_and_parse: RunAndParse, xunit_family: _JunitFamily
     ) -> None:
-        pytester.makepyfile(
-            """
-            import pytest
-            @pytest.mark.xfail(strict=True, reason="This needs to fail!")
-            def test_xpass():
-                pass
-        """
+        @pytest.mark.xfail(strict=True, reason="This needs to fail!")
+        def test_xpass() -> None:
+            pass
+
+        record, dom = run_and_parse(
+            test_xpass, name="test_xfailure_xpass_strict", family=xunit_family
         )
-        _result, dom = run_and_parse(family=xunit_family)
-        # assert result.ret
+        # A strict xpass is a plain failure.
+        record.assert_outcomes(failed=1)
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(skipped=0, tests=1)
         tnode = node.get_first_by_tag("testcase")
@@ -821,12 +921,17 @@ class TestPython:
         fnode = tnode.get_first_by_tag("failure")
         fnode.assert_attr(message="[XPASS(strict)] This needs to fail!")
 
+    # ensemble: needs a module that fails at import time; ensemble sources are
+    # already-imported objects.
     @parametrize_families
     def test_collect_error(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self,
+        pytester: Pytester,
+        run_and_parse_pytester: RunAndParsePytester,
+        xunit_family: _JunitFamily,
     ) -> None:
         pytester.makepyfile("syntax error")
-        result, dom = run_and_parse(family=xunit_family)
+        result, dom = run_and_parse_pytester(family=xunit_family)
         assert result.ret
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=1, tests=1)
@@ -835,44 +940,41 @@ class TestPython:
         fnode.assert_attr(message="collection failure")
         assert "SyntaxError" in fnode.toxml()
 
-    def test_unicode(self, pytester: Pytester, run_and_parse: RunAndParse) -> None:
+    def test_unicode(self, tmp_path: Path, run_and_parse: RunAndParse) -> None:
         value = "hx\xc4\x85\xc4\x87\n"
-        pytester.makepyfile(
-            f"""\
-            # coding: latin1
-            def test_hello():
-                print({value!r})
-                assert 0
-            """
+        # The latin1 coding cookie is the point of the test, so the module has
+        # to be a real file decoded by the import machinery, not a synthesized
+        # one whose source lines would come from this file.
+        p = tmp_path.joinpath("test_unicode.py")
+        p.write_text(
+            f"# coding: latin1\ndef test_hello():\n    print({value!r})\n    assert 0\n",
+            encoding="latin1",
         )
-        result, dom = run_and_parse()
-        assert result.ret == 1
+        record, dom = run_and_parse(module_from_path(p))
+        record.assert_outcomes(failed=1)
         tnode = dom.get_first_by_tag("testcase")
         fnode = tnode.get_first_by_tag("failure")
         assert "hx" in fnode.toxml()
 
-    def test_assertion_binchars(
-        self, pytester: Pytester, run_and_parse: RunAndParse
-    ) -> None:
+    def test_assertion_binchars(self, run_and_parse: RunAndParse) -> None:
         """This test did fail when the escaping wasn't strict."""
-        pytester.makepyfile(
-            """
+        # Module globals in the original; closure variables here.
+        m1 = "\x01\x02\x03\x04"
+        m2 = "\x01\x02\x03\x05"
 
-            M1 = '\x01\x02\x03\x04'
-            M2 = '\x01\x02\x03\x05'
+        def test_str_compare() -> None:
+            assert m1 == m2
 
-            def test_str_compare():
-                assert M1 == M2
-            """
-        )
-        _result, dom = run_and_parse()
+        record, dom = run_and_parse(test_str_compare)
+        record.assert_outcomes(failed=1)
         print(dom.toxml())
 
+    # ensemble: needs item-level capture.
     @pytest.mark.parametrize("junit_logging", ["no", "system-out"])
     def test_pass_captures_stdout(
         self,
         pytester: Pytester,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         junit_logging: _JunitLogging,
     ) -> None:
         pytester.makepyfile(
@@ -881,7 +983,7 @@ class TestPython:
                 print('hello-stdout')
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         pnode = node.get_first_by_tag("testcase")
         if junit_logging == "no":
@@ -894,11 +996,12 @@ class TestPython:
                 "'hello-stdout' should be in system-out"
             )
 
+    # ensemble: needs item-level capture.
     @pytest.mark.parametrize("junit_logging", ["no", "system-err"])
     def test_pass_captures_stderr(
         self,
         pytester: Pytester,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         junit_logging: _JunitLogging,
     ) -> None:
         pytester.makepyfile(
@@ -908,7 +1011,7 @@ class TestPython:
                 sys.stderr.write('hello-stderr')
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         pnode = node.get_first_by_tag("testcase")
         if junit_logging == "no":
@@ -921,11 +1024,12 @@ class TestPython:
                 "'hello-stderr' should be in system-err"
             )
 
+    # ensemble: needs item-level capture.
     @pytest.mark.parametrize("junit_logging", ["no", "system-out"])
     def test_setup_error_captures_stdout(
         self,
         pytester: Pytester,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         junit_logging: _JunitLogging,
     ) -> None:
         pytester.makepyfile(
@@ -940,7 +1044,7 @@ class TestPython:
                 pass
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         pnode = node.get_first_by_tag("testcase")
         if junit_logging == "no":
@@ -953,11 +1057,12 @@ class TestPython:
                 "'hello-stdout' should be in system-out"
             )
 
+    # ensemble: needs item-level capture.
     @pytest.mark.parametrize("junit_logging", ["no", "system-err"])
     def test_setup_error_captures_stderr(
         self,
         pytester: Pytester,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         junit_logging: _JunitLogging,
     ) -> None:
         pytester.makepyfile(
@@ -973,7 +1078,7 @@ class TestPython:
                 pass
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         pnode = node.get_first_by_tag("testcase")
         if junit_logging == "no":
@@ -986,11 +1091,12 @@ class TestPython:
                 "'hello-stderr' should be in system-err"
             )
 
+    # ensemble: needs item-level capture.
     @pytest.mark.parametrize("junit_logging", ["no", "system-out"])
     def test_avoid_double_stdout(
         self,
         pytester: Pytester,
-        run_and_parse: RunAndParse,
+        run_and_parse_pytester: RunAndParsePytester,
         junit_logging: _JunitLogging,
     ) -> None:
         pytester.makepyfile(
@@ -1007,7 +1113,7 @@ class TestPython:
                 sys.stdout.write('hello-stdout call')
         """
         )
-        _result, dom = run_and_parse("-o", f"junit_logging={junit_logging}")
+        _result, dom = run_and_parse_pytester("-o", f"junit_logging={junit_logging}")
         node = dom.get_first_by_tag("testsuite")
         pnode = node.get_first_by_tag("testcase")
         if junit_logging == "no":
@@ -1059,9 +1165,14 @@ def test_dont_configure_on_workers(tmp_path: Path) -> None:
 
 
 class TestNonPython:
+    # ensemble: collects a non-python file through pytest_collect_file; an
+    # ensemble serves preset collectors and never walks the filesystem.
     @parametrize_families
     def test_summing_simple(
-        self, pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+        self,
+        pytester: Pytester,
+        run_and_parse_pytester: RunAndParsePytester,
+        xunit_family: _JunitFamily,
     ) -> None:
         pytester.makeconftest(
             """
@@ -1077,7 +1188,7 @@ class TestNonPython:
         """
         )
         pytester.path.joinpath("myfile.xyz").write_text("hello", encoding="utf-8")
-        result, dom = run_and_parse(family=xunit_family)
+        result, dom = run_and_parse_pytester(family=xunit_family)
         assert result.ret
         node = dom.get_first_by_tag("testsuite")
         node.assert_attr(errors=0, failures=1, skipped=0, tests=1)
@@ -1088,6 +1199,8 @@ class TestNonPython:
         assert "custom item runtest failed" in fnode.toxml()
 
 
+# ensemble: needs item-level capture (the null byte reaches the xml through
+# the captured stdout section).
 @pytest.mark.parametrize("junit_logging", ["no", "system-out"])
 def test_nullbyte(pytester: Pytester, junit_logging: _JunitLogging) -> None:
     # A null byte cannot occur in XML (see section 2.2 of the spec)
@@ -1110,6 +1223,7 @@ def test_nullbyte(pytester: Pytester, junit_logging: _JunitLogging) -> None:
         assert "#x00" not in text
 
 
+# ensemble: needs item-level capture.
 @pytest.mark.parametrize("junit_logging", ["no", "system-out"])
 def test_nullbyte_replace(pytester: Pytester, junit_logging: _JunitLogging) -> None:
     # Check if the null byte gets replaced
@@ -1174,95 +1288,90 @@ def test_logxml_path_expansion(tmp_path: Path, monkeypatch: MonkeyPatch) -> None
     assert xml_var.logfile == str(home_var)
 
 
-def test_logxml_changingdir(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_func():
-            import os
-            os.chdir("a")
-    """
+def test_logxml_changingdir(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    def test_func() -> None:
+        import os
+
+        os.chdir("a")
+
+    # The relative --junitxml path is resolved against the invocation cwd, so
+    # the ensemble has to be run from the rootdir like pytester would.
+    tmp_path.joinpath("a").mkdir()
+    monkeypatch.chdir(tmp_path)
+    spec = ConfigSpec(rootpath=tmp_path, args=("--junitxml=a/x.xml",)).with_plugins(
+        "junitxml"
     )
-    pytester.mkdir("a")
-    result = pytester.runpytest("--junitxml=a/x.xml")
-    assert result.ret == 0
-    assert pytester.path.joinpath("a/x.xml").exists()
+    record = run_tests(test_func, spec=spec)
+    record.assert_outcomes(passed=1)
+    assert tmp_path.joinpath("a/x.xml").exists()
 
 
-def test_logxml_makedir(pytester: Pytester) -> None:
+def test_logxml_makedir(tmp_path: Path) -> None:
     """--junitxml should automatically create directories for the xml file"""
-    pytester.makepyfile(
-        """
-        def test_pass():
-            pass
-    """
-    )
-    result = pytester.runpytest("--junitxml=path/to/results.xml")
-    assert result.ret == 0
-    assert pytester.path.joinpath("path/to/results.xml").exists()
+
+    def test_pass() -> None:
+        pass
+
+    spec = ConfigSpec(
+        rootpath=tmp_path,
+        args=(f"--junitxml={tmp_path.joinpath('path/to/results.xml')}",),
+    ).with_plugins("junitxml")
+    record = run_tests(test_pass, spec=spec)
+    record.assert_outcomes(passed=1)
+    assert tmp_path.joinpath("path/to/results.xml").exists()
 
 
+# ensemble: the UsageError is raised while the args are parsed, and
+# `configured()` then masks it with a KeyError - its finally clause reads
+# `config.stash[config_warnings_key]`, which is only set further down.
 def test_logxml_check_isdir(pytester: Pytester) -> None:
     """Give an error if --junit-xml is a directory (#2089)"""
     result = pytester.runpytest("--junit-xml=.")
     result.stderr.fnmatch_lines(["*--junitxml must be a filename*"])
 
 
-def test_escaped_parametrized_names_xml(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """\
-        import pytest
-        @pytest.mark.parametrize('char', ["\\x00"])
-        def test_func(char):
-            assert char
-        """
-    )
-    result, dom = run_and_parse()
-    assert result.ret == 0
+def test_escaped_parametrized_names_xml(run_and_parse: RunAndParse) -> None:
+    @pytest.mark.parametrize("char", ["\x00"])
+    def test_func(char: str) -> None:
+        assert char
+
+    record, dom = run_and_parse(test_func)
+    record.assert_outcomes(passed=1)
     node = dom.get_first_by_tag("testcase")
     node.assert_attr(name="test_func[\\x00]")
 
 
-def test_double_colon_split_function_issue469(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
-        @pytest.mark.parametrize('param', ["double::colon"])
-        def test_func(param):
-            pass
-    """
+def test_double_colon_split_function_issue469(run_and_parse: RunAndParse) -> None:
+    @pytest.mark.parametrize("param", ["double::colon"])
+    def test_func(param: str) -> None:
+        pass
+
+    record, dom = run_and_parse(
+        test_func, name="test_double_colon_split_function_issue469"
     )
-    result, dom = run_and_parse()
-    assert result.ret == 0
+    record.assert_outcomes(passed=1)
     node = dom.get_first_by_tag("testcase")
     node.assert_attr(classname="test_double_colon_split_function_issue469")
     node.assert_attr(name="test_func[double::colon]")
 
 
-def test_double_colon_split_method_issue469(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
-        class TestClass(object):
-            @pytest.mark.parametrize('param', ["double::colon"])
-            def test_func(self, param):
-                pass
-    """
+def test_double_colon_split_method_issue469(run_and_parse: RunAndParse) -> None:
+    class TestClass:
+        @pytest.mark.parametrize("param", ["double::colon"])
+        def test_func(self, param: str) -> None:
+            pass
+
+    record, dom = run_and_parse(
+        TestClass, name="test_double_colon_split_method_issue469"
     )
-    result, dom = run_and_parse()
-    assert result.ret == 0
+    record.assert_outcomes(passed=1)
     node = dom.get_first_by_tag("testcase")
     node.assert_attr(classname="test_double_colon_split_method_issue469.TestClass")
     node.assert_attr(name="test_func[double::colon]")
 
 
-def test_unicode_issue368(pytester: Pytester) -> None:
-    path = pytester.path.joinpath("test.xml")
+def test_unicode_issue368(tmp_path: Path) -> None:
+    path = tmp_path.joinpath("test.xml")
     log = LogXML(str(path), None)
     ustr = "ВНИ!"
 
@@ -1291,47 +1400,39 @@ def test_unicode_issue368(pytester: Pytester) -> None:
     log.pytest_sessionfinish()
 
 
-def test_record_property(pytester: Pytester, run_and_parse: RunAndParse) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+def test_record_property(run_and_parse: RunAndParse) -> None:
+    @pytest.fixture
+    def other(record_property: RecordFunc) -> None:
+        record_property("bar", 1)
 
-        @pytest.fixture
-        def other(record_property):
-            record_property("bar", 1)
-        def test_record(record_property, other):
-            record_property("foo", "<1");
-    """
-    )
-    result, dom = run_and_parse()
+    def test_record(record_property: RecordFunc, other: None) -> None:
+        record_property("foo", "<1")
+
+    record, dom = run_and_parse(other, test_record)
     node = dom.get_first_by_tag("testsuite")
     tnode = node.get_first_by_tag("testcase")
     psnode = tnode.get_first_by_tag("properties")
     pnodes = psnode.find_by_tag("property")
     pnodes[0].assert_attr(name="bar", value="1")
     pnodes[1].assert_attr(name="foo", value="<1")
-    result.stdout.fnmatch_lines(["*= 1 passed in *"])
+    # was: result.stdout.fnmatch_lines(["*= 1 passed in *"])
+    record.assert_outcomes(passed=1)
 
 
 def test_record_property_on_test_and_teardown_failure(
-    pytester: Pytester, run_and_parse: RunAndParse
+    run_and_parse: RunAndParse,
 ) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+    @pytest.fixture
+    def other(record_property: RecordFunc) -> Generator[None]:
+        record_property("bar", 1)
+        yield
+        assert 0
 
-        @pytest.fixture
-        def other(record_property):
-            record_property("bar", 1)
-            yield
-            assert 0
+    def test_record(record_property: RecordFunc, other: None) -> None:
+        record_property("foo", "<1")
+        assert 0
 
-        def test_record(record_property, other):
-            record_property("foo", "<1")
-            assert 0
-    """
-    )
-    result, dom = run_and_parse()
+    record, dom = run_and_parse(other, test_record)
     node = dom.get_first_by_tag("testsuite")
     tnodes = node.find_by_tag("testcase")
     for tnode in tnodes:
@@ -1340,20 +1441,18 @@ def test_record_property_on_test_and_teardown_failure(
         pnodes = psnode.find_by_tag("property")
         pnodes[0].assert_attr(name="bar", value="1")
         pnodes[1].assert_attr(name="foo", value="<1")
-    result.stdout.fnmatch_lines(["*= 1 failed, 1 error *"])
+    # was: result.stdout.fnmatch_lines(["*= 1 failed, 1 error *"])
+    record.assert_outcomes(failed=1, errors=1)
 
 
-def test_record_property_same_name(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """
-        def test_record_with_same_name(record_property):
-            record_property("foo", "bar")
-            record_property("foo", "baz")
-    """
-    )
-    _result, dom = run_and_parse()
+def test_record_property_same_name(run_and_parse: RunAndParse) -> None:
+    def test_record_with_same_name(
+        record_property: RecordFunc,
+    ) -> None:
+        record_property("foo", "bar")
+        record_property("foo", "baz")
+
+    _record, dom = run_and_parse(test_record_with_same_name)
     node = dom.get_first_by_tag("testsuite")
     tnode = node.get_first_by_tag("testcase")
     psnode = tnode.get_first_by_tag("properties")
@@ -1362,88 +1461,124 @@ def test_record_property_same_name(
     pnodes[1].assert_attr(name="foo", value="baz")
 
 
+def _record_property_test() -> Callable[..., None]:
+    def test_record(record_property: RecordFunc) -> None:
+        record_property("foo", "bar")
+
+    return test_record
+
+
+def _record_xml_attribute_test() -> Callable[..., None]:
+    def test_record(record_xml_attribute: RecordFunc) -> None:
+        record_xml_attribute("foo", "bar")
+
+    return test_record
+
+
+#: The two record fixtures, as sources requesting them by real parameter name.
+#: A source requests a fixture through its own signature, so the two variants
+#: the original built by string formatting are two real functions here.
+RECORD_FIXTURE_TESTS = {
+    "record_property": _record_property_test,
+    "record_xml_attribute": _record_xml_attribute_test,
+}
+
+
+def _record_property_pair() -> tuple[Callable[..., None], Callable[..., None]]:
+    @pytest.fixture
+    def other(record_property: RecordFunc) -> None:
+        record_property("bar", 1)
+
+    def test_record(record_property: RecordFunc, other: None) -> None:
+        record_property("foo", "<1")
+
+    return other, test_record
+
+
+def _record_xml_attribute_pair() -> tuple[Callable[..., None], Callable[..., None]]:
+    @pytest.fixture
+    def other(record_xml_attribute: RecordFunc) -> None:
+        record_xml_attribute("bar", 1)
+
+    def test_record(record_xml_attribute: RecordFunc, other: None) -> None:
+        record_xml_attribute("foo", "<1")
+
+    return other, test_record
+
+
+#: The same two, as the fixture/test pair of ``test_record_fixtures_xunit2``.
+RECORD_FIXTURE_PAIRS = {
+    "record_property": _record_property_pair,
+    "record_xml_attribute": _record_xml_attribute_pair,
+}
+
+
 @pytest.mark.parametrize("fixture_name", ["record_property", "record_xml_attribute"])
-def test_record_fixtures_without_junitxml(
-    pytester: Pytester, fixture_name: str
-) -> None:
-    pytester.makepyfile(
-        f"""
-        def test_record({fixture_name}):
-            {fixture_name}("foo", "bar")
-    """
-    )
-    result = pytester.runpytest()
-    assert result.ret == 0
+def test_record_fixtures_without_junitxml(tmp_path: Path, fixture_name: str) -> None:
+    test_record = RECORD_FIXTURE_TESTS[fixture_name]()
+
+    spec = ConfigSpec(rootpath=tmp_path).with_plugins("junitxml")
+    record = run_tests(test_record, spec=spec)
+    record.assert_outcomes(passed=1)
 
 
-@pytest.mark.filterwarnings("default")
-def test_record_attribute(pytester: Pytester, run_and_parse: RunAndParse) -> None:
-    pytester.makeini(
-        """
-        [pytest]
-        junit_family = xunit1
-    """
-    )
-    pytester.makepyfile(
-        """
-        import pytest
+def test_record_attribute(run_and_parse: RunAndParse) -> None:
+    @pytest.fixture
+    def other(record_xml_attribute: RecordFunc) -> None:
+        record_xml_attribute("bar", 1)
 
-        @pytest.fixture
-        def other(record_xml_attribute):
-            record_xml_attribute("bar", 1)
-        def test_record(record_xml_attribute, other):
-            record_xml_attribute("foo", "<1");
-    """
+    def test_record(record_xml_attribute: RecordFunc, other: None) -> None:
+        record_xml_attribute("foo", "<1")
+
+    record, dom = run_and_parse(
+        other,
+        test_record,
+        family=None,
+        # "always" is the ensemble's stand-in for the host-level
+        # `@pytest.mark.filterwarnings("default")` of the original: process
+        # global filters are inherited, and this suite both errors on
+        # warnings and ignores PytestExperimentalApiWarning.
+        inicfg={"junit_family": "xunit1", "filterwarnings": ["always"]},
     )
-    result, dom = run_and_parse()
     node = dom.get_first_by_tag("testsuite")
     tnode = node.get_first_by_tag("testcase")
     tnode.assert_attr(bar="1")
     tnode.assert_attr(foo="<1")
-    result.stdout.fnmatch_lines(
-        ["*test_record_attribute.py:6:*record_xml_attribute is an experimental feature"]
-    )
+    # The rendered warning quoted the generated file and line, which for an
+    # ensemble source would be this file; the recorded warning is the same
+    # warning, asserted as an object rather than as a line of output.
+    assert [str(w.message) for w in record.warnings] == [
+        "record_xml_attribute is an experimental feature"
+    ]
 
 
-@pytest.mark.filterwarnings("default")
 @pytest.mark.parametrize("fixture_name", ["record_xml_attribute", "record_property"])
-def test_record_fixtures_xunit2(
-    pytester: Pytester, fixture_name: str, run_and_parse: RunAndParse
-) -> None:
+def test_record_fixtures_xunit2(fixture_name: str, run_and_parse: RunAndParse) -> None:
     """Ensure record_xml_attribute and record_property drop values when outside of legacy family."""
-    pytester.makeini(
-        """
-        [pytest]
-        junit_family = xunit2
-    """
-    )
-    pytester.makepyfile(
-        f"""
-        import pytest
+    other, test_record = RECORD_FIXTURE_PAIRS[fixture_name]()
 
-        @pytest.fixture
-        def other({fixture_name}):
-            {fixture_name}("bar", 1)
-        def test_record({fixture_name}, other):
-            {fixture_name}("foo", "<1");
-    """
+    record, _dom = run_and_parse(
+        other,
+        test_record,
+        family=None,
+        inicfg={"junit_family": "xunit2", "filterwarnings": ["always"]},
     )
-
-    result, _dom = run_and_parse(family=None)
-    expected_lines = []
-    if fixture_name == "record_xml_attribute":
-        expected_lines.append(
-            "*test_record_fixtures_xunit2.py:6:*record_xml_attribute is an experimental feature"
-        )
-    expected_lines = [
-        f"*test_record_fixtures_xunit2.py:6:*{fixture_name} is incompatible "
+    expected = [
+        f"{fixture_name} is incompatible "
         "with junit_family 'xunit2' (use 'legacy' or 'xunit1')"
     ]
-    result.stdout.fnmatch_lines(expected_lines)
+    if fixture_name == "record_xml_attribute":
+        expected.insert(0, "record_xml_attribute is an experimental feature")
+    # The original only ever asserted the last line it built; both warnings
+    # are checked here.
+    assert [str(w.message) for w in record.warnings] == expected
 
 
+# ensemble: xdist.
 def test_random_report_log_xdist(
-    pytester: Pytester, monkeypatch: MonkeyPatch, run_and_parse: RunAndParse
+    pytester: Pytester,
+    monkeypatch: MonkeyPatch,
+    run_and_parse_pytester: RunAndParsePytester,
 ) -> None:
     """`xdist` calls pytest_runtest_logreport as they are executed by the workers,
     with nodes from several nodes overlapping, so junitxml must cope with that
@@ -1458,7 +1593,7 @@ def test_random_report_log_xdist(
             assert i != 22
     """
     )
-    _, dom = run_and_parse("-n2")
+    _, dom = run_and_parse_pytester("-n2")
     suite_node = dom.get_first_by_tag("testsuite")
     failed = []
     for case_node in suite_node.find_by_tag("testcase"):
@@ -1470,15 +1605,13 @@ def test_random_report_log_xdist(
 
 @parametrize_families
 def test_root_testsuites_tag(
-    pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+    run_and_parse: RunAndParse, xunit_family: _JunitFamily
 ) -> None:
-    pytester.makepyfile(
-        """
-        def test_x():
-            pass
-    """
-    )
-    _, dom = run_and_parse(family=xunit_family)
+    def test_x() -> None:
+        pass
+
+    record, dom = run_and_parse(test_x, family=xunit_family)
+    record.assert_outcomes(passed=1)
     root = dom.get_unique_child
     assert root.tag == "testsuites"
     root.assert_attr(name="pytest tests")
@@ -1486,22 +1619,27 @@ def test_root_testsuites_tag(
     assert suite_node.tag == "testsuite"
 
 
-def test_runs_twice(pytester: Pytester, run_and_parse: RunAndParse) -> None:
-    f = pytester.makepyfile(
-        """
-        def test_pass():
-            pass
-    """
-    )
+def test_runs_twice(run_and_parse: RunAndParse) -> None:
+    def test_pass() -> None:
+        pass
 
-    result, dom = run_and_parse("--keep-duplicates", f, f)
-    result.stdout.no_fnmatch_line("*INTERNALERROR*")
+    # `--keep-duplicates` plus the same file twice is how the original got one
+    # module collected twice; handing the same module object over twice is the
+    # ensemble equivalent, and produces the same duplicated nodeids that
+    # junitxml has to cope with.
+    module = build_module("test_runs_twice", test_pass)
+    record, dom = run_and_parse(module, module)
+    # was: result.stdout.no_fnmatch_line("*INTERNALERROR*")
+    record.assert_outcomes(passed=2)
     first, second = (x["classname"] for x in dom.find_by_tag("testcase"))
     assert first == second
 
 
+# ensemble: xdist.
 def test_runs_twice_xdist(
-    pytester: Pytester, monkeypatch: MonkeyPatch, run_and_parse: RunAndParse
+    pytester: Pytester,
+    monkeypatch: MonkeyPatch,
+    run_and_parse_pytester: RunAndParsePytester,
 ) -> None:
     pytest.importorskip("xdist")
     monkeypatch.delenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD")
@@ -1512,13 +1650,17 @@ def test_runs_twice_xdist(
     """
     )
 
-    result, dom = run_and_parse(f, "--dist", "each", "--tx", "2*popen")
+    result, dom = run_and_parse_pytester(f, "--dist", "each", "--tx", "2*popen")
     result.stdout.no_fnmatch_line("*INTERNALERROR*")
     first, second = (x["classname"] for x in dom.find_by_tag("testcase"))
     assert first == second
 
 
-def test_fancy_items_regression(pytester: Pytester, run_and_parse: RunAndParse) -> None:
+# ensemble: custom File/Item collectors served from pytest_collect_file, which
+# needs the filesystem collection an ensemble replaces.
+def test_fancy_items_regression(
+    pytester: Pytester, run_and_parse_pytester: RunAndParsePytester
+) -> None:
     # issue 1259
     pytester.makeconftest(
         """
@@ -1551,7 +1693,7 @@ def test_fancy_items_regression(pytester: Pytester, run_and_parse: RunAndParse) 
     """
     )
 
-    result, dom = run_and_parse()
+    result, dom = run_and_parse_pytester()
 
     result.stdout.no_fnmatch_line("*INTERNALERROR*")
 
@@ -1576,8 +1718,8 @@ def test_fancy_items_regression(pytester: Pytester, run_and_parse: RunAndParse) 
 
 
 @parametrize_families
-def test_global_properties(pytester: Pytester, xunit_family: _JunitFamily) -> None:
-    path = pytester.path.joinpath("test_global_properties.xml")
+def test_global_properties(tmp_path: Path, xunit_family: _JunitFamily) -> None:
+    path = tmp_path.joinpath("test_global_properties.xml")
     log = LogXML(str(path), None, family=xunit_family)
 
     class Report(BaseReport):
@@ -1610,9 +1752,9 @@ def test_global_properties(pytester: Pytester, xunit_family: _JunitFamily) -> No
     assert actual == expected
 
 
-def test_url_property(pytester: Pytester) -> None:
+def test_url_property(tmp_path: Path) -> None:
     test_url = "http://www.github.com/pytest-dev"
-    path = pytester.path.joinpath("test_url_property.xml")
+    path = tmp_path.joinpath("test_url_property.xml")
     log = LogXML(str(path), None)
 
     class Report(BaseReport):
@@ -1638,19 +1780,16 @@ def test_url_property(pytester: Pytester) -> None:
 
 @parametrize_families
 def test_record_testsuite_property(
-    pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+    run_and_parse: RunAndParse, xunit_family: _JunitFamily
 ) -> None:
-    pytester.makepyfile(
-        """
-        def test_func1(record_testsuite_property):
-            record_testsuite_property("stats", "all good")
+    def test_func1(record_testsuite_property: RecordFunc) -> None:
+        record_testsuite_property("stats", "all good")
 
-        def test_func2(record_testsuite_property):
-            record_testsuite_property("stats", 10)
-    """
-    )
-    result, dom = run_and_parse(family=xunit_family)
-    assert result.ret == 0
+    def test_func2(record_testsuite_property: RecordFunc) -> None:
+        record_testsuite_property("stats", 10)
+
+    record, dom = run_and_parse(test_func1, test_func2, family=xunit_family)
+    record.assert_outcomes(passed=2)
     node = dom.get_first_by_tag("testsuite")
     properties_node = node.get_first_by_tag("properties")
     p1_node, p2_node = properties_node.find_by_tag(
@@ -1660,31 +1799,25 @@ def test_record_testsuite_property(
     p2_node.assert_attr(name="stats", value="10")
 
 
-def test_record_testsuite_property_junit_disabled(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_func1(record_testsuite_property):
-            record_testsuite_property("stats", "all good")
-    """
-    )
-    result = pytester.runpytest()
-    assert result.ret == 0
+def test_record_testsuite_property_junit_disabled(tmp_path: Path) -> None:
+    def test_func1(record_testsuite_property: RecordFunc) -> None:
+        record_testsuite_property("stats", "all good")
+
+    spec = ConfigSpec(rootpath=tmp_path).with_plugins("junitxml")
+    record = run_tests(test_func1, spec=spec)
+    record.assert_outcomes(passed=1)
 
 
 @pytest.mark.parametrize("junit", [True, False])
-def test_record_testsuite_property_type_checking(
-    pytester: Pytester, junit: bool
-) -> None:
-    pytester.makepyfile(
-        """
-        def test_func1(record_testsuite_property):
-            record_testsuite_property(1, 2)
-    """
-    )
-    args = ("--junitxml=tests.xml",) if junit else ()
-    result = pytester.runpytest(*args)
-    assert result.ret == 1
-    result.stdout.fnmatch_lines(
+def test_record_testsuite_property_type_checking(tmp_path: Path, junit: bool) -> None:
+    def test_func1(record_testsuite_property: RecordFunc) -> None:
+        record_testsuite_property(1, 2)  # type: ignore[arg-type]
+
+    args = (f"--junitxml={tmp_path.joinpath('tests.xml')}",) if junit else ()
+    spec = ConfigSpec(rootpath=tmp_path, args=args).with_plugins("junitxml")
+    record = run_tests(test_func1, spec=spec, capture_output=True)
+    record.assert_outcomes(failed=1)
+    record.stdout.fnmatch_lines(
         ["*TypeError: name parameter needs to be a string, but int given"]
     )
 
@@ -1692,96 +1825,79 @@ def test_record_testsuite_property_type_checking(
 @pytest.mark.parametrize("suite_name", ["my_suite", ""])
 @parametrize_families
 def test_set_suite_name(
-    pytester: Pytester,
     suite_name: str,
     run_and_parse: RunAndParse,
     xunit_family: _JunitFamily,
 ) -> None:
+    inicfg: dict[str, object] = {}
     if suite_name:
-        pytester.makeini(
-            f"""
-            [pytest]
-            junit_suite_name={suite_name}
-            junit_family={xunit_family}
-        """
-        )
+        inicfg = {"junit_suite_name": suite_name, "junit_family": xunit_family}
         expected = suite_name
     else:
         expected = "pytest"
-    pytester.makepyfile(
-        """
-        import pytest
 
-        def test_func():
-            pass
-    """
+    def test_func() -> None:
+        pass
+
+    record, dom = run_and_parse(
+        test_func, inicfg=inicfg, family=xunit_family, suite_name=expected
     )
-    result, dom = run_and_parse(family=xunit_family, suite_name=expected)
-    assert result.ret == 0
+    record.assert_outcomes(passed=1)
     node = dom.get_first_by_tag("testsuite")
     node.assert_attr(name=expected)
 
 
-def test_escaped_skipreason_issue3533(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
-        @pytest.mark.skip(reason='1 <> 2')
-        def test_skip():
-            pass
-    """
-    )
-    _, dom = run_and_parse()
+def test_escaped_skipreason_issue3533(run_and_parse: RunAndParse) -> None:
+    @pytest.mark.skip(reason="1 <> 2")
+    def test_skip() -> None:
+        pass
+
+    record, dom = run_and_parse(test_skip)
+    record.assert_outcomes(skipped=1)
     node = dom.get_first_by_tag("testcase")
     snode = node.get_first_by_tag("skipped")
     assert "1 <> 2" in snode.text
     snode.assert_attr(message="1 <> 2")
 
 
-def test_bin_escaped_skipreason(pytester: Pytester, run_and_parse: RunAndParse) -> None:
+def test_bin_escaped_skipreason(run_and_parse: RunAndParse) -> None:
     """Escape special characters from mark.skip reason (#11842)."""
-    pytester.makepyfile(
-        """
-        import pytest
-        @pytest.mark.skip("\33[31;1mred\33[0m")
-        def test_skip():
-            pass
-    """
-    )
-    _, dom = run_and_parse()
+
+    @pytest.mark.skip("\33[31;1mred\33[0m")
+    def test_skip() -> None:
+        pass
+
+    record, dom = run_and_parse(test_skip)
+    record.assert_outcomes(skipped=1)
     node = dom.get_first_by_tag("testcase")
     snode = node.get_first_by_tag("skipped")
     assert "#x1B[31;1mred#x1B[0m" in snode.text
     snode.assert_attr(message="#x1B[31;1mred#x1B[0m")
 
 
-def test_escaped_setup_teardown_error(
-    pytester: Pytester, run_and_parse: RunAndParse
-) -> None:
-    pytester.makepyfile(
-        """
-        import pytest
+def test_escaped_setup_teardown_error(run_and_parse: RunAndParse) -> None:
+    @pytest.fixture
+    def my_setup() -> None:
+        raise Exception("error: \033[31mred\033[m")
 
-        @pytest.fixture()
-        def my_setup():
-            raise Exception("error: \033[31mred\033[m")
+    def test_esc(my_setup: None) -> None:
+        pass
 
-        def test_esc(my_setup):
-            pass
-    """
-    )
-    _, dom = run_and_parse()
+    record, dom = run_and_parse(my_setup, test_esc)
+    record.assert_outcomes(errors=1)
     node = dom.get_first_by_tag("testcase")
     snode = node.get_first_by_tag("error")
     assert "#x1B[31mred#x1B[m" in snode["message"]
     assert "#x1B[31mred#x1B[m" in snode.text
 
 
+# ensemble: junit_log_passing_tests only shows in the presence of item-level
+# capture; with nothing captured the assertions would hold vacuously.
 @parametrize_families
 def test_logging_passing_tests_disabled_does_not_log_test_output(
-    pytester: Pytester, run_and_parse: RunAndParse, xunit_family: _JunitFamily
+    pytester: Pytester,
+    run_and_parse_pytester: RunAndParsePytester,
+    xunit_family: _JunitFamily,
 ) -> None:
     pytester.makeini(
         f"""
@@ -1803,19 +1919,20 @@ def test_logging_passing_tests_disabled_does_not_log_test_output(
             logging.warning('hello')
     """
     )
-    result, dom = run_and_parse(family=xunit_family)
+    result, dom = run_and_parse_pytester(family=xunit_family)
     assert result.ret == 0
     node = dom.get_first_by_tag("testcase")
     assert len(node.find_by_tag("system-err")) == 0
     assert len(node.find_by_tag("system-out")) == 0
 
 
+# ensemble: needs item-level capture.
 @parametrize_families
 @pytest.mark.parametrize("junit_logging", ["no", "system-out", "system-err"])
 def test_logging_passing_tests_disabled_logs_output_for_failing_test_issue5430(
     pytester: Pytester,
     junit_logging: _JunitLogging,
-    run_and_parse: RunAndParse,
+    run_and_parse_pytester: RunAndParsePytester,
     xunit_family: _JunitFamily,
 ) -> None:
     pytester.makeini(
@@ -1836,7 +1953,7 @@ def test_logging_passing_tests_disabled_logs_output_for_failing_test_issue5430(
             assert 0
     """
     )
-    result, dom = run_and_parse(
+    result, dom = run_and_parse_pytester(
         "-o", f"junit_logging={junit_logging}", family=xunit_family
     )
     assert result.ret == 1
@@ -1853,14 +1970,24 @@ def test_logging_passing_tests_disabled_logs_output_for_failing_test_issue5430(
         assert len(node.find_by_tag("system-out")) == 0
 
 
-def test_no_message_quiet(pytester: Pytester) -> None:
+def test_no_message_quiet(tmp_path: Path) -> None:
     """Do not show the summary banner when --quiet is given (#13700)."""
-    pytester.makepyfile("def test(): pass")
-    result = pytester.runpytest("--junitxml=pytest.xml")
-    result.stdout.fnmatch_lines("* generated xml file: *")
 
-    result = pytester.runpytest("--junitxml=pytest.xml", "--quiet")
-    result.stdout.no_fnmatch_line("* generated xml file: *")
+    def test() -> None:
+        pass
+
+    xml = tmp_path.joinpath("pytest.xml")
+    spec = ConfigSpec(rootpath=tmp_path, args=(f"--junitxml={xml}",)).with_plugins(
+        "junitxml"
+    )
+    record = run_tests(test, spec=spec, capture_output=True)
+    record.stdout.fnmatch_lines(["* generated xml file: *"])
+
+    spec = ConfigSpec(
+        rootpath=tmp_path, args=(f"--junitxml={xml}", "--quiet")
+    ).with_plugins("junitxml")
+    record = run_tests(test, spec=spec, capture_output=True)
+    record.stdout.no_fnmatch_line("* generated xml file: *")
 
 
 @pytest.mark.parametrize(
@@ -1871,16 +1998,17 @@ def test_no_message_quiet(pytester: Pytester) -> None:
         ("junit_family", "xunit3"),
     ],
 )
-def test_invalid_junit_option_value(pytester: Pytester, name: str, value: str) -> None:
+def test_invalid_junit_option_value(tmp_path: Path, name: str, value: str) -> None:
     """Invalid junit option values fail with a clean usage error."""
-    pytester.makeini(
-        f"""
-        [pytest]
-        {name} = {value}
-        """
-    )
-    result = pytester.runpytest("--junitxml=junit.xml")
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(
-        [f"*ERROR: *config option '{name}' expects one of *, got '{value}'"]
-    )
+    spec = ConfigSpec(
+        rootpath=tmp_path,
+        args=(f"--junitxml={tmp_path.joinpath('junit.xml')}",),
+        inicfg={name: value},
+    ).with_plugins("junitxml")
+    # pytester saw the usage error rendered on stderr and the USAGE_ERROR exit
+    # code; the ensemble sees the UsageError itself, raised while junitxml is
+    # being configured.
+    with pytest.raises(
+        UsageError, match=f"config option '{name}' expects one of .*, got '{value}'"
+    ):
+        run_tests(spec=spec)

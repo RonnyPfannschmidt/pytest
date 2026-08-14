@@ -6,16 +6,27 @@ import dataclasses
 import importlib.metadata
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import types
+import unittest
 
 import setuptools
 
 from _pytest.config import ExitCode
+from _pytest.ensemble import build_module
+from _pytest.ensemble import ConfigSpec
+from _pytest.ensemble import module_from_path
+from _pytest.ensemble import run_tests
+from _pytest.ensemble import RunRecord
 from _pytest.pathlib import symlink_or_skip
 from _pytest.pytester import Pytester
 import pytest
+
+
+#: The example scripts, run as themselves rather than copied somewhere first.
+EXAMPLES = Path(__file__).parent / "example_scripts"
 
 
 def prepend_pythonpath(*dirs) -> str:
@@ -26,6 +37,8 @@ def prepend_pythonpath(*dirs) -> str:
 
 
 class TestGeneralUsage:
+    # ensemble: a conftest raising UsageError, reported on stderr with the
+    # usage exit code - none of the three has an ensemble equivalent.
     def test_config_error(self, pytester: Pytester) -> None:
         pytester.copy_example("conftest_usageerror/conftest.py")
         result = pytester.runpytest(pytester.path)
@@ -33,12 +46,15 @@ class TestGeneralUsage:
         result.stderr.fnmatch_lines(["*ERROR: hello"])
         result.stdout.fnmatch_lines(["*pytest_unconfigure_called"])
 
+    # ensemble: importing a conftest file.
     def test_root_conftest_syntax_error(self, pytester: Pytester) -> None:
         pytester.makepyfile(conftest="raise SyntaxError\n")
         result = pytester.runpytest()
         result.stderr.fnmatch_lines(["*raise SyntaxError*"])
         assert result.ret != 0
 
+    # ensemble: INTERNALERROR rendering belongs to wrap_session, and the
+    # traceback names the conftest file it came from.
     def test_early_hook_error_issue38_1(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -59,6 +75,7 @@ class TestGeneralUsage:
             ["*INTERNALERROR*def pytest_sessionstart():*", "*INTERNALERROR*0 / 0*"]
         )
 
+    # ensemble: as above, for a failure during configure.
     def test_early_hook_configure_error_issue38(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -73,11 +90,14 @@ class TestGeneralUsage:
             ["*INTERNALERROR*File*conftest.py*line 2*", "*0 / 0*"]
         )
 
+    # ensemble: path arguments are resolved by the invocation; a spec's args
+    # are never coerced to paths and collection is preset.
     def test_file_not_found(self, pytester: Pytester) -> None:
         result = pytester.runpytest("asd")
         assert result.ret != 0
         result.stderr.fnmatch_lines(["ERROR: file or directory not found: asd"])
 
+    # ensemble: as above, plus conftest hooks and the usage exit code.
     def test_file_not_found_unconfigure_issue143(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -92,6 +112,7 @@ class TestGeneralUsage:
         result.stderr.fnmatch_lines(["ERROR: file or directory not found: asd"])
         result.stdout.fnmatch_lines(["*---configure", "*---unconfigure"])
 
+    # ensemble: -p plugin loading from the command line, during preparse.
     def test_config_preparse_plugin_option(self, pytester: Pytester) -> None:
         pytester.makepyfile(
             pytest_xyz="""
@@ -109,6 +130,8 @@ class TestGeneralUsage:
         assert result.ret == 0
         result.stdout.fnmatch_lines(["*1 passed*"])
 
+    # ensemble: setuptools entry point autoloading, which an ensemble config
+    # deliberately never does.
     @pytest.mark.parametrize("load_cov_early", [True, False])
     def test_early_load_setuptools_name(
         self, pytester: Pytester, monkeypatch, load_cov_early
@@ -155,6 +178,8 @@ class TestGeneralUsage:
         else:
             assert loaded == ["myplugin1", "myplugin2", "mycov"]
 
+    # ensemble: assertion rewriting happens at import, under an --import-mode;
+    # ensemble sources are never imported by pytest.
     @pytest.mark.parametrize("import_mode", ["prepend", "append", "importlib"])
     def test_assertion_rewrite(self, pytester: Pytester, import_mode) -> None:
         p = pytester.makepyfile(
@@ -168,6 +193,7 @@ class TestGeneralUsage:
         result.stdout.fnmatch_lines([">       assert x", "E       assert 0"])
         assert result.ret == 1
 
+    # ensemble: an error raised while importing the test module.
     def test_nested_import_error(self, pytester: Pytester) -> None:
         p = pytester.makepyfile(
             """
@@ -186,6 +212,8 @@ class TestGeneralUsage:
         )
         assert result.ret == 2
 
+    # ensemble: what the invocation does with arguments that match no
+    # collector, down to the usage exit code.
     def test_not_collectable_arguments(self, pytester: Pytester) -> None:
         p1 = pytester.makepyfile("")
         p2 = pytester.makefile(".pyc", "123")
@@ -199,6 +227,8 @@ class TestGeneralUsage:
             ]
         )
 
+    # ensemble: a conftest failing to import, and --help, which is served
+    # from pytest_cmdline_main.
     @pytest.mark.filterwarnings("default")
     def test_better_reporting_on_conftest_load_failure(
         self, pytester: Pytester
@@ -230,6 +260,7 @@ class TestGeneralUsage:
             "E   ModuleNotFoundError: No module named 'qwerty'",
         ]
 
+    # ensemble: pytest_collect_file only fires while walking a directory tree.
     def test_early_skip(self, pytester: Pytester) -> None:
         pytester.mkdir("xyz")
         pytester.makeconftest(
@@ -243,12 +274,15 @@ class TestGeneralUsage:
         assert result.ret == ExitCode.NO_TESTS_COLLECTED
         result.stdout.fnmatch_lines(["*1 skip*"])
 
+    # ensemble: a custom file collector from an example tree, listed by
+    # --collect-only.
     def test_issue88_initial_file_multinodes(self, pytester: Pytester) -> None:
         pytester.copy_example("issue88_initial_file_multinodes")
         p = pytester.makepyfile("def test_hello(): pass")
         result = pytester.runpytest(p, "--collect-only")
         result.stdout.fnmatch_lines(["*MyFile*test_issue88*", "*Module*test_issue88*"])
 
+    # ensemble: global capturing around conftest import; capture does not nest.
     def test_issue93_initialnode_importing_capturing(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -262,6 +296,7 @@ class TestGeneralUsage:
         result.stdout.no_fnmatch_line("*should not be seen*")
         assert "stderr42" not in result.stderr.str()
 
+    # ensemble: as above - a conftest printing before it fails to import.
     def test_conftest_printing_shows_if_error(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -273,6 +308,8 @@ class TestGeneralUsage:
         assert result.ret != 0
         assert "should be seen" in result.stdout.str()
 
+    # ensemble: conftest visibility is per-directory; an ensemble plugin object
+    # stands for a rootdir conftest and nothing below it.
     def test_issue109_sibling_conftests_not_loaded(self, pytester: Pytester) -> None:
         sub1 = pytester.mkdir("sub1")
         sub2 = pytester.mkdir("sub2")
@@ -287,6 +324,7 @@ class TestGeneralUsage:
         result = pytester.runpytest(sub1)
         assert result.ret == ExitCode.USAGE_ERROR
 
+    # ensemble: pytest_ignore_collect during a directory walk.
     def test_directory_skipped(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -300,6 +338,8 @@ class TestGeneralUsage:
         assert result.ret == ExitCode.NO_TESTS_COLLECTED
         result.stdout.fnmatch_lines(["*1 skipped*"])
 
+    # ensemble: a custom File collector contributed by pytest_collect_file,
+    # then addressed by nodeid on the command line.
     def test_multiple_items_per_collector_byid(self, pytester: Pytester) -> None:
         c = pytester.makeconftest(
             """
@@ -319,24 +359,28 @@ class TestGeneralUsage:
         assert result.ret == 0
         result.stdout.fnmatch_lines(["*1 pass*"])
 
-    def test_skip_on_generated_funcarg_id(self, pytester: Pytester) -> None:
-        pytester.makeconftest(
-            """
-            import pytest
-            def pytest_generate_tests(metafunc):
-                metafunc.parametrize('x', [3], ids=['hello-123'])
-            def pytest_runtest_setup(item):
-                print(item.keywords)
-                if 'hello-123' in item.keywords:
+    def test_skip_on_generated_funcarg_id(self, tmp_path: Path) -> None:
+        class ConftestPlugin:
+            def pytest_generate_tests(self, metafunc):
+                metafunc.parametrize("x", [3], ids=["hello-123"])
+
+            def pytest_runtest_setup(self, item):
+                if "hello-123" in item.keywords:
                     pytest.skip("hello")
                 assert 0
-        """
-        )
-        p = pytester.makepyfile("""def test_func(x): pass""")
-        res = pytester.runpytest(p)
-        assert res.ret == 0
-        res.stdout.fnmatch_lines(["*1 skipped*"])
 
+        def test_func(x):
+            pass
+
+        record = run_tests(
+            test_func,
+            spec=ConfigSpec(rootpath=tmp_path, extra_plugins=(ConftestPlugin(),)),
+        )
+        record.assert_outcomes(skipped=1)
+        assert record["test_func[hello-123]"].skipped
+
+    # ensemble: selecting an item by nodeid argument - the point of the test;
+    # ensemble collection is preset, not resolved from args.
     def test_direct_addressing_selects(self, pytester: Pytester) -> None:
         p = pytester.makepyfile(
             """
@@ -350,45 +394,31 @@ class TestGeneralUsage:
         assert res.ret == 0
         res.stdout.fnmatch_lines(["*1 passed*"])
 
-    def test_direct_addressing_selects_duplicates(self, pytester: Pytester) -> None:
-        p = pytester.makepyfile(
-            """
-            import pytest
+    def test_direct_addressing_selects_duplicates(self, tmp_path: Path) -> None:
+        @pytest.mark.parametrize("a", [1, 2, 10, 11, 2, 1, 12, 11])
+        def test_func(a):
+            pass
 
-            @pytest.mark.parametrize("a", [1, 2, 10, 11, 2, 1, 12, 11])
-            def test_func(a):
-                pass
-            """
-        )
-        result = pytester.runpytest(p)
-        result.assert_outcomes(failed=0, passed=8)
+        record = run_tests(test_func, rootpath=tmp_path)
+        record.assert_outcomes(failed=0, passed=8)
 
-    def test_direct_addressing_selects_duplicates_1(self, pytester: Pytester) -> None:
-        p = pytester.makepyfile(
-            """
-            import pytest
+    def test_direct_addressing_selects_duplicates_1(self, tmp_path: Path) -> None:
+        @pytest.mark.parametrize("a", [1, 2, 10, 11, 2, 1, 12, 1_1, 2_1])
+        def test_func(a):
+            pass
 
-            @pytest.mark.parametrize("a", [1, 2, 10, 11, 2, 1, 12, 1_1,2_1])
-            def test_func(a):
-                pass
-            """
-        )
-        result = pytester.runpytest(p)
-        result.assert_outcomes(failed=0, passed=9)
+        record = run_tests(test_func, rootpath=tmp_path)
+        record.assert_outcomes(failed=0, passed=9)
 
-    def test_direct_addressing_selects_duplicates_2(self, pytester: Pytester) -> None:
-        p = pytester.makepyfile(
-            """
-            import pytest
+    def test_direct_addressing_selects_duplicates_2(self, tmp_path: Path) -> None:
+        @pytest.mark.parametrize("a", ["a", "b", "c", "a", "a1"])
+        def test_func(a):
+            pass
 
-            @pytest.mark.parametrize("a", ["a","b","c","a","a1"])
-            def test_func(a):
-                pass
-            """
-        )
-        result = pytester.runpytest(p)
-        result.assert_outcomes(failed=0, passed=5)
+        record = run_tests(test_func, rootpath=tmp_path)
+        record.assert_outcomes(failed=0, passed=5)
 
+    # ensemble: as above, for a nodeid that matches nothing.
     def test_direct_addressing_notfound(self, pytester: Pytester) -> None:
         p = pytester.makepyfile(
             """
@@ -407,6 +437,7 @@ class TestGeneralUsage:
             if name.startswith("pytest_"):
                 assert value.__doc__, f"no docstring for {name}"
 
+    # ensemble: the internal-error exit code and its stderr rendering.
     def test_initialization_error_issue49(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -419,6 +450,7 @@ class TestGeneralUsage:
         result.stderr.fnmatch_lines(["INTERNAL*pytest_configure*", "INTERNAL*x*"])
         assert "sessionstarttime" not in result.stderr.str()
 
+    # ensemble: a syntax error at import, reached through a nodeid argument.
     @pytest.mark.parametrize("lookfor", ["test_fun.py::test_a"])
     def test_issue134_report_error_when_collecting_member(
         self, pytester: Pytester, lookfor
@@ -435,6 +467,8 @@ class TestGeneralUsage:
             result.stderr.fnmatch_lines(["*ERROR*"])
             assert result.ret == 4  # usage error only if item not found
 
+    # ensemble: initial arguments that all fail, and the exit code the
+    # conftest asserts on in pytest_sessionfinish.
     def test_report_all_failed_collections_initargs(self, pytester: Pytester) -> None:
         pytester.makeconftest(
             """
@@ -451,6 +485,7 @@ class TestGeneralUsage:
         result.stdout.fnmatch_lines(["pytest_sessionfinish_called"])
         assert result.ret == ExitCode.USAGE_ERROR
 
+    # ensemble: pytest's import hooks, exercised by importing the test module.
     def test_namespace_import_doesnt_confuse_import_hook(
         self, pytester: Pytester
     ) -> None:
@@ -476,6 +511,7 @@ class TestGeneralUsage:
         res = pytester.runpytest(p.name)
         assert res.ret == 0
 
+    # ensemble: argument parsing errors, reported on stderr.
     def test_unknown_option(self, pytester: Pytester) -> None:
         result = pytester.runpytest("--qwlkej")
         result.stderr.fnmatch_lines(
@@ -484,27 +520,25 @@ class TestGeneralUsage:
         """
         )
 
-    def test_getsourcelines_error_issue553(
-        self, pytester: Pytester, monkeypatch
-    ) -> None:
-        monkeypatch.setattr("inspect.getsourcelines", None)
-        p = pytester.makepyfile(
-            """
-            def raise_error(obj):
-                raise OSError('source code not available')
+    def test_getsourcelines_error_issue553(self, tmp_path: Path, monkeypatch) -> None:
+        def raise_error(obj):
+            raise OSError("source code not available")
 
-            import inspect
-            inspect.getsourcelines = raise_error
+        # The original patched inspect from inside the test module; the patch
+        # is process-global either way, so it is applied from here instead.
+        monkeypatch.setattr("inspect.getsourcelines", raise_error)
 
-            def test_foo(invalid_fixture):
-                pass
-        """
-        )
-        res = pytester.runpytest(p)
-        res.stdout.fnmatch_lines(
+        def test_foo(invalid_fixture):
+            pass
+
+        record = run_tests(test_foo, rootpath=tmp_path, capture_output=True)
+        # A fixture missing at setup is an error, not a failure.
+        record.assert_outcomes(errors=1)
+        record.stdout.fnmatch_lines(
             ["*source code not available*", "E*fixture 'invalid_fixture' not found"]
         )
 
+    # ensemble: the pytest.main() entry point and its plugins= argument.
     def test_plugins_given_as_strings(
         self, pytester: Pytester, monkeypatch, _sys_snapshot
     ) -> None:
@@ -520,33 +554,26 @@ class TestGeneralUsage:
         monkeypatch.setitem(sys.modules, "myplugin", mod)
         assert pytest.main(args=[str(pytester.path)], plugins=["myplugin"]) == 0
 
-    def test_parametrized_with_bytes_regex(self, pytester: Pytester) -> None:
-        p = pytester.makepyfile(
-            """
-            import re
-            import pytest
-            @pytest.mark.parametrize('r', [re.compile(b'foo')])
-            def test_stuff(r):
-                pass
-        """
-        )
-        res = pytester.runpytest(p)
-        res.stdout.fnmatch_lines(["*1 passed*"])
+    def test_parametrized_with_bytes_regex(self, tmp_path: Path) -> None:
+        @pytest.mark.parametrize("r", [re.compile(b"foo")])
+        def test_stuff(r):
+            pass
 
-    def test_parametrized_with_null_bytes(self, pytester: Pytester) -> None:
+        record = run_tests(test_stuff, rootpath=tmp_path)
+        record.assert_outcomes(passed=1)
+
+    def test_parametrized_with_null_bytes(self, tmp_path: Path) -> None:
         """Test parametrization with values that contain null bytes and unicode characters (#2644, #2957)"""
-        p = pytester.makepyfile(
-            """\
-            import pytest
 
-            @pytest.mark.parametrize("data", [b"\\x00", "\\x00", 'ação'])
-            def test_foo(data):
-                assert data
-            """
-        )
-        res = pytester.runpytest(p)
-        res.assert_outcomes(passed=3)
+        @pytest.mark.parametrize("data", [b"\x00", "\x00", "ação"])
+        def test_foo(data):
+            assert data
 
+        record = run_tests(test_foo, rootpath=tmp_path)
+        record.assert_outcomes(passed=3)
+
+    # ensemble: @argsfile expansion, and the nodeid arguments it expands to.
+    #
     # Warning ignore because of:
     # https://github.com/python/cpython/issues/85308
     # Can be removed once Python<3.12 support is dropped.
@@ -575,6 +602,12 @@ class TestGeneralUsage:
 
 
 class TestInvocationVariants:
+    # ensemble: nothing in this class is portable, and that is the point of it
+    # - every test here is about pytest *as it is invoked*: as a subprocess,
+    # via python -m, through pytest.main(), or with --pyargs resolving import
+    # names against sys.path. An ensemble is the opposite end of that: no
+    # process, no argv, no import system. Individual reasons are noted only
+    # where a test looks portable at a glance.
     def test_earlyinit(self, pytester: Pytester) -> None:
         p = pytester.makepyfile(
             """
@@ -809,6 +842,7 @@ class TestInvocationVariants:
             ["*test_world.py::test_other*PASSED*", "*1 passed*"]
         )
 
+    # ensemble: --doctest-modules collects from the file, addressed by nodeid.
     def test_invoke_test_and_doctestmodules(self, pytester: Pytester) -> None:
         p = pytester.makepyfile(
             """
@@ -884,21 +918,24 @@ class TestInvocationVariants:
         result.stderr.fnmatch_lines(["ERROR*module*or*package*not*found*"])
 
     @pytest.mark.xfail(reason="decide: feature or bug")
-    def test_noclass_discovery_if_not_testcase(self, pytester: Pytester) -> None:
-        testpath = pytester.makepyfile(
-            """
-            import unittest
-            class TestHello(object):
-                def test_hello(self):
-                    assert self.attr
+    def test_noclass_discovery_if_not_testcase(self, tmp_path: Path) -> None:
+        class TestHello:
+            # Declared, never defined: the mixin only works once something
+            # provides it, which is the whole question the test asks. The
+            # source used to be a string, so mypy never saw it before.
+            attr: int
 
-            class RealTest(unittest.TestCase, TestHello):
-                attr = 42
-        """
-        )
-        reprec = pytester.inline_run(testpath)
-        reprec.assertoutcome(passed=1)
+            def test_hello(self):
+                assert self.attr
 
+        class RealTest(unittest.TestCase, TestHello):
+            attr = 42
+
+        record = run_tests(TestHello, RealTest, rootpath=tmp_path)
+        record.assert_outcomes(passed=1)
+
+    # ensemble: a .txt file collected by the doctest plugin, twice, addressed
+    # by nodeid.
     def test_doctest_id(self, pytester: Pytester) -> None:
         pytester.makefile(
             ".txt",
@@ -951,54 +988,77 @@ class TestDurations:
             timing.sleep(0.020)
     """
 
-    def test_calls(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=10")
-        assert result.ret == 0
+    @staticmethod
+    def build_source() -> types.ModuleType:
+        """:attr:`source`, as real functions in a module of their own.
 
-        result.stdout.fnmatch_lines_random(
+        Deliberately named: the module name is what the duration lines
+        report, so the nodeid assertions below stay meaningful.
+        """
+        from _pytest import timing
+
+        def test_something():
+            pass
+
+        def test_2():
+            timing.sleep(0.010)
+
+        def test_1():
+            timing.sleep(0.002)
+
+        def test_3():
+            timing.sleep(0.020)
+
+        return build_module("test_durations", test_something, test_2, test_1, test_3)
+
+    @staticmethod
+    def run(tmp_path: Path, *args: str) -> RunRecord:
+        return run_tests(
+            TestDurations.build_source(),
+            spec=ConfigSpec(rootpath=tmp_path, args=args),
+            capture_output=True,
+        )
+
+    def test_calls(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=10")
+        record.assert_outcomes(passed=4)
+
+        record.stdout.fnmatch_lines_random(
             ["*durations*", "*call*test_3*", "*call*test_2*"]
         )
 
-        result.stdout.fnmatch_lines(
+        record.stdout.fnmatch_lines(
             ["(8 durations < 0.005s hidden.  Use -vv to show these durations.)"]
         )
 
-    def test_calls_show_2(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=2")
-        assert result.ret == 0
+    def test_calls_show_2(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=2")
+        record.assert_outcomes(passed=4)
 
-        lines = result.stdout.get_lines_after("*slowest*durations*")
+        lines = record.stdout.get_lines_after("*slowest*durations*")
         assert "4 passed" in lines[2]
 
-    def test_calls_showall(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=0")
-        assert result.ret == 0
-        TestDurations.check_tests_in_output(result.stdout.lines, 2, 3)
+    def test_calls_showall(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=0")
+        record.assert_outcomes(passed=4)
+        TestDurations.check_tests_in_output(record.stdout.lines, 2, 3)
 
-    def test_calls_showall_verbose(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=0", "-vv")
-        assert result.ret == 0
-        TestDurations.check_tests_in_output(result.stdout.lines, 1, 2, 3)
+    def test_calls_showall_verbose(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=0", "-vv")
+        record.assert_outcomes(passed=4)
+        TestDurations.check_tests_in_output(record.stdout.lines, 1, 2, 3)
 
-    def test_calls_showall_durationsmin(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=0", "--durations-min=0.015")
-        assert result.ret == 0
-        TestDurations.check_tests_in_output(result.stdout.lines, 3)
+    def test_calls_showall_durationsmin(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=0", "--durations-min=0.015")
+        record.assert_outcomes(passed=4)
+        TestDurations.check_tests_in_output(record.stdout.lines, 3)
 
     def test_calls_showall_durationsmin_verbose(
-        self, pytester: Pytester, mock_timing
+        self, tmp_path: Path, mock_timing
     ) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess(
-            "--durations=0", "--durations-min=0.015", "-vv"
-        )
-        assert result.ret == 0
-        TestDurations.check_tests_in_output(result.stdout.lines, 3)
+        record = self.run(tmp_path, "--durations=0", "--durations-min=0.015", "-vv")
+        record.assert_outcomes(passed=4)
+        TestDurations.check_tests_in_output(record.stdout.lines, 3)
 
     @staticmethod
     def check_tests_in_output(
@@ -1014,13 +1074,14 @@ class TestDurations:
         }
         assert found_test_numbers == set(expected_test_numbers)
 
-    def test_with_deselected(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=2", "-k test_3")
-        assert result.ret == 0
+    def test_with_deselected(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "--durations=2", "-k", "test_3")
+        record.assert_outcomes(passed=1, deselected=3)
 
-        result.stdout.fnmatch_lines(["*durations*", "*call*test_3*"])
+        record.stdout.fnmatch_lines(["*durations*", "*call*test_3*"])
 
+    # ensemble: the collection error is a module that fails to import, and the
+    # "Interrupted: 1 error during collection" line is wrap_session's.
     def test_with_failing_collection(self, pytester: Pytester, mock_timing) -> None:
         pytester.makepyfile(self.source)
         pytester.makepyfile(test_collecterror="""xyz""")
@@ -1032,10 +1093,10 @@ class TestDurations:
         # output
         result.stdout.no_fnmatch_line("*duration*")
 
-    def test_with_not(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("-k not 1")
-        assert result.ret == 0
+    def test_with_not(self, tmp_path: Path, mock_timing) -> None:
+        record = self.run(tmp_path, "-k", "not 1")
+        # The original only asserted the exit code; "not 1" deselects test_1.
+        record.assert_outcomes(passed=3, deselected=1)
 
 
 class TestDurationsWithFixture:
@@ -1051,12 +1112,24 @@ class TestDurationsWithFixture:
             timing.sleep(5)
     """
 
-    def test_setup_function(self, pytester: Pytester, mock_timing) -> None:
-        pytester.makepyfile(self.source)
-        result = pytester.runpytest_inprocess("--durations=10")
-        assert result.ret == 0
+    def test_setup_function(self, tmp_path: Path, mock_timing) -> None:
+        from _pytest import timing
 
-        result.stdout.fnmatch_lines_random(
+        @pytest.fixture
+        def setup_fixt():
+            timing.sleep(2)
+
+        def test_1(setup_fixt):
+            timing.sleep(5)
+
+        record = run_tests(
+            build_module("test_durations_fixture", setup_fixt, test_1),
+            spec=ConfigSpec(rootpath=tmp_path, args=("--durations=10",)),
+            capture_output=True,
+        )
+        record.assert_outcomes(passed=1)
+
+        record.stdout.fnmatch_lines_random(
             """
             *durations*
             5.00s call *test_1*
@@ -1065,6 +1138,7 @@ class TestDurationsWithFixture:
         )
 
 
+# ensemble: a zipapp, run as its own process.
 def test_zipimport_hook(pytester: Pytester) -> None:
     """Test package loader is being used correctly (see #1837)."""
     zipapp = pytest.importorskip("zipapp")
@@ -1088,6 +1162,7 @@ def test_zipimport_hook(pytester: Pytester) -> None:
     result.stdout.no_fnmatch_line("*INTERNALERROR>*")
 
 
+# ensemble: pytest_plugins in a conftest, naming a module to import.
 def test_import_plugin_unicode_name(pytester: Pytester) -> None:
     pytester.makepyfile(myplugin="")
     pytester.makepyfile("def test(): pass")
@@ -1096,6 +1171,7 @@ def test_import_plugin_unicode_name(pytester: Pytester) -> None:
     assert r.ret == 0
 
 
+# ensemble: as above - the subject is what a conftest's pytest_plugins may be.
 def test_pytest_plugins_as_module(pytester: Pytester) -> None:
     """Do not raise an error if pytest_plugins attribute is a module (#3899)"""
     pytester.makepyfile(
@@ -1110,34 +1186,36 @@ def test_pytest_plugins_as_module(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["* 1 passed in *"])
 
 
-def test_deferred_hook_checking(pytester: Pytester) -> None:
+def test_deferred_hook_checking(tmp_path: Path) -> None:
     """Check hooks as late as possible (#1821)."""
-    pytester.syspathinsert()
-    pytester.makepyfile(
-        **{
-            "plugin.py": """
-        class Hooks(object):
-            def pytest_my_hook(self, config):
-                pass
 
-        def pytest_configure(config):
+    class Hooks:
+        def pytest_my_hook(self, config):
+            pass
+
+    class Plugin:
+        def pytest_configure(self, config):
             config.pluginmanager.add_hookspecs(Hooks)
-        """,
-            "conftest.py": """
-            pytest_plugins = ['plugin']
-            def pytest_my_hook(config):
-                return 40
-        """,
-            "test_foo.py": """
-            def test(request):
-                assert request.config.hook.pytest_my_hook(config=request.config) == [40]
-        """,
-        }
+
+    class ConftestPlugin:
+        # Registered while pytest_my_hook has no hookspec yet - the spec only
+        # arrives from the plugin above, at configure time. That the impl is
+        # still wired up to it is the whole point.
+        def pytest_my_hook(self, config):
+            return 40
+
+    def test(request):
+        assert request.config.hook.pytest_my_hook(config=request.config) == [40]
+
+    record = run_tests(
+        test,
+        spec=ConfigSpec(rootpath=tmp_path, extra_plugins=(Plugin(), ConftestPlugin())),
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(["* 1 passed *"])
+    record.assert_outcomes(passed=1)
 
 
+# ensemble: deliberately a subprocess - an in-process run keeps the objects
+# alive through the host's HookRecorder, which is exactly what it must not do.
 def test_fixture_values_leak(pytester: Pytester) -> None:
     """Ensure that fixture objects are properly destroyed by the garbage collector at the end of their expected
     life-times (#2981).
@@ -1186,31 +1264,30 @@ def test_fixture_values_leak(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["* 2 passed *"])
 
 
-def test_fixture_order_respects_scope(pytester: Pytester) -> None:
+def test_fixture_order_respects_scope(tmp_path: Path) -> None:
     """Ensure that fixtures are created according to scope order (#2405)."""
-    pytester.makepyfile(
-        """
-        import pytest
+    # A module global in an ensemble source would be *this* file's global,
+    # so the state the fixtures share is a closure cell instead.
+    data: dict[str, bool] = {}
 
-        data = {}
+    @pytest.fixture(scope="module")
+    def clean_data():
+        data.clear()
 
-        @pytest.fixture(scope='module')
-        def clean_data():
-            data.clear()
+    @pytest.fixture(autouse=True)
+    def add_data():
+        data.update(value=True)
 
-        @pytest.fixture(autouse=True)
-        def add_data():
-            data.update(value=True)
+    @pytest.mark.usefixtures("clean_data")
+    def test_value():
+        assert data.get("value")
 
-        @pytest.mark.usefixtures('clean_data')
-        def test_value():
-            assert data.get('value')
-    """
-    )
-    result = pytester.runpytest()
-    assert result.ret == 0
+    record = run_tests(clean_data, add_data, test_value, rootpath=tmp_path)
+    # The original only asserted the exit code.
+    record.assert_outcomes(passed=1)
 
 
+# ensemble: as above - deliberately a subprocess, for the same reason.
 def test_frame_leak_on_failing_test(pytester: Pytester) -> None:
     """Pytest would leak garbage referencing the frames of tests that failed
     that could never be reclaimed (#2798).
@@ -1244,36 +1321,43 @@ def test_frame_leak_on_failing_test(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines(["*1 failed, 1 passed in*"])
 
 
-def test_fixture_mock_integration(pytester: Pytester) -> None:
+def test_fixture_mock_integration() -> None:
     """Test that decorators applied to fixture are left working (#3774)"""
-    p = pytester.copy_example("acceptance/fixture_mock_integration.py")
-    result = pytester.runpytest(p)
-    result.stdout.fnmatch_lines(["*1 passed*"])
+    example = EXAMPLES / "acceptance/fixture_mock_integration.py"
+    record = run_tests(module_from_path(example), rootpath=example.parent)
+    record.assert_outcomes(passed=1)
 
 
+# ensemble: the exit code is the whole test.
 def test_usage_error_code(pytester: Pytester) -> None:
     result = pytester.runpytest("-unknown-option-")
     assert result.ret == ExitCode.USAGE_ERROR
 
 
-def test_error_on_async_function(pytester: Pytester) -> None:
+def test_error_on_async_function(tmp_path: Path) -> None:
     # In the below we .close() the coroutine only to avoid
     # "RuntimeWarning: coroutine 'test_2' was never awaited"
     # which messes with other tests.
-    pytester.makepyfile(
-        test_async="""
-        async def test_1():
-            pass
-        async def test_2():
-            pass
-        def test_3():
-            coro = test_2()
-            coro.close()
-            return coro
-    """
+    async def test_1():
+        pass
+
+    async def test_2():
+        pass
+
+    def test_3():
+        coro = test_2()
+        coro.close()
+        return coro
+
+    record = run_tests(
+        test_1,
+        test_2,
+        test_3,
+        rootpath=tmp_path,
+        name="test_async",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*async def functions are not natively supported*",
             "*test_async.py::test_1*",
@@ -1281,22 +1365,28 @@ def test_error_on_async_function(pytester: Pytester) -> None:
             "*test_async.py::test_3*",
         ]
     )
-    result.assert_outcomes(failed=3)
+    record.assert_outcomes(failed=3)
 
 
-def test_error_on_async_gen_function(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        test_async="""
-        async def test_1():
-            yield
-        async def test_2():
-            yield
-        def test_3():
-            return test_2()
-    """
+def test_error_on_async_gen_function(tmp_path: Path) -> None:
+    async def test_1():
+        yield
+
+    async def test_2():
+        yield
+
+    def test_3():
+        return test_2()
+
+    record = run_tests(
+        test_1,
+        test_2,
+        test_3,
+        rootpath=tmp_path,
+        name="test_async",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.stdout.fnmatch_lines(
+    record.stdout.fnmatch_lines(
         [
             "*async def functions are not natively supported*",
             "*test_async.py::test_1*",
@@ -1304,29 +1394,29 @@ def test_error_on_async_gen_function(pytester: Pytester) -> None:
             "*test_async.py::test_3*",
         ]
     )
-    result.assert_outcomes(failed=3)
+    record.assert_outcomes(failed=3)
 
 
-def test_error_on_sync_test_async_fixture(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        test_sync="""
-            import pytest
+def test_error_on_sync_test_async_fixture(tmp_path: Path) -> None:
+    @pytest.fixture
+    async def async_fixture(): ...
 
-            @pytest.fixture
-            async def async_fixture():
-                ...
+    def test_foo(async_fixture):
+        # suppress unawaited coroutine warning
+        try:
+            async_fixture.send(None)
+        except StopIteration:
+            pass
 
-            def test_foo(async_fixture):
-                # suppress unawaited coroutine warning
-                try:
-                    async_fixture.send(None)
-                except StopIteration:
-                    pass
-        """
+    record = run_tests(
+        async_fixture,
+        test_foo,
+        rootpath=tmp_path,
+        name="test_sync",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.assert_outcomes(errors=1)
-    result.stdout.fnmatch_lines(
+    record.assert_outcomes(errors=1)
+    record.stdout.fnmatch_lines(
         [
             "'test_foo' requested an async fixture 'async_fixture', with no plugin or hook that handled it. "
             "This is an error, as pytest does not natively support it."
@@ -1334,23 +1424,24 @@ def test_error_on_sync_test_async_fixture(pytester: Pytester) -> None:
     )
 
 
-def test_error_on_sync_test_async_fixture_gen(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        test_sync="""
-            import pytest
+def test_error_on_sync_test_async_fixture_gen(tmp_path: Path) -> None:
+    @pytest.fixture
+    async def async_fixture():
+        yield
 
-            @pytest.fixture
-            async def async_fixture():
-                yield
+    def test_foo(async_fixture):
+        # async gens don't emit unawaited-coroutine
+        ...
 
-            def test_foo(async_fixture):
-                # async gens don't emit unawaited-coroutine
-                ...
-        """
+    record = run_tests(
+        async_fixture,
+        test_foo,
+        rootpath=tmp_path,
+        name="test_sync",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.assert_outcomes(errors=1)
-    result.stdout.fnmatch_lines(
+    record.assert_outcomes(errors=1)
+    record.stdout.fnmatch_lines(
         [
             "'test_foo' requested an async fixture 'async_fixture', with no plugin or hook that handled it. "
             "This is an error, as pytest does not natively support it."
@@ -1358,27 +1449,27 @@ def test_error_on_sync_test_async_fixture_gen(pytester: Pytester) -> None:
     )
 
 
-def test_error_on_sync_test_async_autouse_fixture(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        test_sync="""
-            import pytest
+def test_error_on_sync_test_async_autouse_fixture(tmp_path: Path) -> None:
+    @pytest.fixture(autouse=True)
+    async def async_fixture(): ...
 
-            @pytest.fixture(autouse=True)
-            async def async_fixture():
-                ...
+    # We explicitly request the fixture to be able to
+    # suppress the RuntimeWarning for unawaited coroutine.
+    def test_foo(async_fixture):
+        try:
+            async_fixture.send(None)
+        except StopIteration:
+            pass
 
-            # We explicitly request the fixture to be able to
-            # suppress the RuntimeWarning for unawaited coroutine.
-            def test_foo(async_fixture):
-                try:
-                    async_fixture.send(None)
-                except StopIteration:
-                    pass
-        """
+    record = run_tests(
+        async_fixture,
+        test_foo,
+        rootpath=tmp_path,
+        name="test_sync",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    result.assert_outcomes(errors=1)
-    result.stdout.fnmatch_lines(
+    record.assert_outcomes(errors=1)
+    record.stdout.fnmatch_lines(
         [
             "'test_foo' requested an async fixture 'async_fixture' with autouse=True, "
             "with no plugin or hook that handled it. "
@@ -1387,6 +1478,8 @@ def test_error_on_sync_test_async_autouse_fixture(pytester: Pytester) -> None:
     )
 
 
+# ensemble: register_assert_rewrite from a conftest, verified by the rewritten
+# explanation of an assertion in an imported module.
 def test_pdb_can_be_rewritten(pytester: Pytester) -> None:
     pytester.makepyfile(
         **{
@@ -1422,6 +1515,7 @@ def test_pdb_can_be_rewritten(pytester: Pytester) -> None:
     assert result.ret == 1
 
 
+# ensemble: global capturing (--capture=tee-sys) does not nest.
 def test_tee_stdio_captures_and_live_prints(pytester: Pytester) -> None:
     testpath = pytester.makepyfile(
         """
@@ -1449,6 +1543,7 @@ def test_tee_stdio_captures_and_live_prints(pytester: Pytester) -> None:
     assert "@this is stderr@\n" in fullXml
 
 
+# ensemble: a real process whose stdout is closed under it.
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="Windows raises `OSError: [Errno 22] Invalid argument` instead",
@@ -1470,18 +1565,22 @@ def test_no_brokenpipeerror_message(pytester: Pytester) -> None:
     popen.stderr.close()
 
 
-@pytest.mark.filterwarnings("default")
-def test_function_return_non_none_warning(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        """
-        def test_stuff():
-            return "something"
-    """
+def test_function_return_non_none_warning(tmp_path: Path) -> None:
+    def test_stuff():
+        return "something"
+
+    # The host runs with filterwarnings=error and those filters are inherited,
+    # so the ensemble states its own.
+    record = run_tests(
+        test_stuff,
+        spec=ConfigSpec(rootpath=tmp_path, inicfg={"filterwarnings": ["always"]}),
+        capture_output=True,
     )
-    res = pytester.runpytest()
-    res.stdout.fnmatch_lines(["*Did you mean to use `assert` instead of `return`?*"])
+    record.assert_outcomes(passed=1, warnings=1)
+    record.stdout.fnmatch_lines(["*Did you mean to use `assert` instead of `return`?*"])
 
 
+# ensemble: --import-mode importlib and the module identity it yields.
 def test_doctest_and_normal_imports_with_importlib(pytester: Pytester) -> None:
     """
     Regression test for #10811: previously import_path with ImportMode.importlib would
@@ -1517,6 +1616,7 @@ def test_doctest_and_normal_imports_with_importlib(pytester: Pytester) -> None:
     result.stdout.fnmatch_lines("*1 passed*")
 
 
+# ensemble: installs a package and runs the pytest console script against it.
 @pytest.mark.skip(reason="Test is not isolated")
 def test_issue_9765(pytester: Pytester) -> None:
     """Reproducer for issue #9765 on Windows
@@ -1582,6 +1682,9 @@ def test_issue_9765(pytester: Pytester) -> None:
         ) from exc
 
 
+# ensemble: an ensemble runs without the terminal plugin by default, so the
+# same source here would assert nothing about `-p no:terminal` blocking it in a
+# real invocation - which, with the exit code, is the whole smoke test.
 def test_no_terminal_plugin(pytester: Pytester) -> None:
     """Smoke test to ensure pytest can execute without the terminal plugin (#9422)."""
     pytester.makepyfile("def test(): assert 1 == 2")
@@ -1589,6 +1692,8 @@ def test_no_terminal_plugin(pytester: Pytester) -> None:
     assert result.ret == ExitCode.TESTS_FAILED
 
 
+# ensemble: StopIteration raised while *importing* the module, and the
+# "Interrupted" line wrap_session prints for it.
 def test_stop_iteration_from_collect(pytester: Pytester) -> None:
     pytester.makepyfile(test_it="raise StopIteration('hello')")
     result = pytester.runpytest()
@@ -1604,27 +1709,36 @@ def test_stop_iteration_from_collect(pytester: Pytester) -> None:
     )
 
 
-def test_stop_iteration_runtest_protocol(pytester: Pytester) -> None:
-    pytester.makepyfile(
-        test_it="""
-        import pytest
-        @pytest.fixture
-        def fail_setup():
-            raise StopIteration(1)
-        def test_fail_setup(fail_setup):
-            pass
-        def test_fail_teardown(request):
-            def stop_iteration():
-                raise StopIteration(2)
-            request.addfinalizer(stop_iteration)
-        def test_fail_call():
-            raise StopIteration(3)
-        """
+def test_stop_iteration_runtest_protocol(tmp_path: Path) -> None:
+    @pytest.fixture
+    def fail_setup():
+        raise StopIteration(1)
+
+    def test_fail_setup(fail_setup):
+        pass
+
+    def test_fail_teardown(request):
+        def stop_iteration():
+            raise StopIteration(2)
+
+        request.addfinalizer(stop_iteration)
+
+    def test_fail_call():
+        raise StopIteration(3)
+
+    # ensemble: the exit code has no equivalent; the outcome counts below are
+    # what ExitCode.TESTS_FAILED stood for.
+    record = run_tests(
+        fail_setup,
+        test_fail_setup,
+        test_fail_teardown,
+        test_fail_call,
+        rootpath=tmp_path,
+        name="test_it",
+        capture_output=True,
     )
-    result = pytester.runpytest()
-    assert result.ret == ExitCode.TESTS_FAILED
-    result.assert_outcomes(failed=1, passed=1, errors=2)
-    result.stdout.fnmatch_lines(
+    record.assert_outcomes(failed=1, passed=1, errors=2)
+    record.stdout.fnmatch_lines(
         [
             "=* short test summary info =*",
             "FAILED test_it.py::test_fail_call - StopIteration: 3",
