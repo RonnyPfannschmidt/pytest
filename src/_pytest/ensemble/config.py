@@ -21,6 +21,7 @@ from _pytest.config.findpaths import parse_override_ini
 from _pytest.stash import StashKey
 from _pytest.terminal import terminal_file_key
 from _pytest.tmpdir import TempPathFactory
+from _pytest.unraisableexception import gc_collect_iterations_key
 
 
 #: Warnings raised while the ensemble config was being configured or
@@ -100,6 +101,15 @@ class ConfigSpec:
     #: costs no root scan and is cleaned up with the host. Build one with
     #: :func:`make_tmp_path_factory`.
     tmp_path_factory: TempPathFactory | None = None
+
+    #: How many ``gc.collect()`` passes ``unraisableexception`` makes, when
+    #: that plugin is opted into at all. It is not in :data:`DEFAULT_PLUGINS`,
+    #: and even when loaded an ensemble does not collect by default: the heap
+    #: it would walk is the *host* process's, so a full pass costs whatever
+    #: the host happens to be holding rather than anything the ensemble owns.
+    #: Raise it only for a test that needs finalizers flushed before an
+    #: unraisable exception can surface.
+    gc_collect_iterations: int = 0
 
     #: Stream the terminal plugin writes to, when it is loaded at all. An
     #: ensemble must never be given the stdout of whatever is running it,
@@ -267,6 +277,9 @@ def configured(spec: ConfigSpec) -> Iterator[Config]:
             config._inicache.clear()
 
         config._finalize_parse(args, decide_args=False)
+        # Read by ``unraisableexception`` at configure, cleanup and
+        # unconfigure time; harmless when that plugin was not opted into.
+        config.stash[gc_collect_iterations_key] = spec.gc_collect_iterations
         if spec.output is not None:
             # Must be stashed before configure: the terminal reporter binds
             # its stream when it is constructed, and must never bind ours.

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Generator
 from contextlib import ExitStack
+import gc
 import os
 from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 import warnings
 
 from _pytest._io import TerminalWriter
@@ -20,6 +23,7 @@ from _pytest.ensemble import build_module
 from _pytest.ensemble import collect_tests
 from _pytest.ensemble import ConfigSpec
 from _pytest.ensemble import configured
+from _pytest.ensemble import DEFAULT_PLUGINS
 from _pytest.ensemble import Ensemble
 from _pytest.ensemble import EnsembleModule
 from _pytest.ensemble import make_tmp_path_factory
@@ -991,3 +995,45 @@ class TestTmpPath:
             run_tests(test_it, spec=spec).assert_outcomes(passed=1)
 
         assert len(set(seen)) == 2
+
+
+class TestUnraisable:
+    """``unraisableexception`` is opt-in, and never collects by default."""
+
+    @staticmethod
+    def _counting_collect(counter: list[int]) -> Callable[..., int]:
+        real_collect = gc.collect
+
+        def counting(*args: object, **kwargs: object) -> int:
+            counter[0] += 1
+            return real_collect(*args, **kwargs)  # type: ignore[arg-type]
+
+        return counting
+
+    def test_not_loaded_by_default(self) -> None:
+        assert "unraisableexception" not in DEFAULT_PLUGINS
+
+    def test_opted_in_does_not_collect_by_default(self, tmp_path: Path) -> None:
+        """Loading the plugin must not make the ensemble walk the host heap."""
+
+        def test_it() -> None:
+            pass
+
+        counter = [0]
+        spec = ConfigSpec(rootpath=tmp_path).with_plugins("unraisableexception")
+        with mock.patch.object(gc, "collect", self._counting_collect(counter)):
+            run_tests(test_it, spec=spec).assert_outcomes(passed=1)
+        assert counter[0] == 0
+
+    def test_iterations_are_honoured(self, tmp_path: Path) -> None:
+        def test_it() -> None:
+            pass
+
+        counter = [0]
+        spec = ConfigSpec(rootpath=tmp_path, gc_collect_iterations=2).with_plugins(
+            "unraisableexception"
+        )
+        with mock.patch.object(gc, "collect", self._counting_collect(counter)):
+            run_tests(test_it, spec=spec).assert_outcomes(passed=1)
+        # Two passes, at both the unconfigure and the cleanup site.
+        assert counter[0] == 4
