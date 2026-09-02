@@ -145,6 +145,13 @@ def pytest_addoption(parser: Parser) -> None:
         "max_warnings",
         help="Exit with error if all tests pass but the number of warnings exceeds this threshold",
     )
+    parser.addini(
+        "deferred_warnings_report",
+        default="eager",
+        help="Where warnings matching a 'defer' filter are reported: "
+        "'eager' fails the test that emitted them, "
+        "'summary' lists them at the end of the session",
+    )
 
     group = parser.getgroup("collect", "collection")
     group.addoption(

@@ -1,0 +1,13 @@
+Added a ``defer`` warning filter action, valid anywhere a warning filter is accepted
+(:option:`-W <pytest -W>`, the :confval:`filterwarnings` ini option and
+:ref:`@pytest.mark.filterwarnings <filterwarnings>`).
+
+Unlike ``error``, which raises at the :func:`warnings.warn` call site and aborts the code
+under test halfway through, a deferred warning is recorded, the code under test runs to
+completion, and pytest fails afterwards. The new :confval:`deferred_warnings_report` option
+chooses where: ``eager`` (the default) fails the test that emitted the warning, ``summary``
+lists them at the end of the session and exits with the new
+``ExitCode.DEFERRED_WARNINGS_ERROR``.
+
+pytest also prints a one-line notice when an ``error`` filter is configured and ``defer``
+is not, pointing at the new action. Erroring immediately remains fully supported.

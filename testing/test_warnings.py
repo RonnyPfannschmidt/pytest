@@ -1153,3 +1153,194 @@ def test_pythonwarnings_not_duplicated(pytester: Pytester) -> None:
     warnings_list = config.known_args_namespace.pythonwarnings
     assert warnings_list is not None
     assert warnings_list == ["error"]
+
+
+class TestDeferredWarnings:
+    """The ``defer`` filter action (#14912)."""
+
+    def _emitting_test(self, pytester: Pytester) -> None:
+        # In-process pytester runs inherit the filters of the outer session,
+        # which runs under ``filterwarnings = error``.
+        pytester.makeini(
+            """
+            [pytest]
+            filterwarnings =
+                always::UserWarning
+            """
+        )
+        pytester.makepyfile(
+            """
+            import warnings
+
+            def test_emits():
+                warnings.warn("deferred me", UserWarning)
+                print("body ran to completion")
+
+            def test_clean():
+                pass
+            """
+        )
+
+    def test_eager_fails_only_the_emitting_test(self, pytester: Pytester) -> None:
+        self._emitting_test(pytester)
+
+        result = pytester.runpytest("-W", "defer::UserWarning", "-s")
+
+        result.assert_outcomes(passed=1, failed=1, warnings=1)
+        result.stdout.fnmatch_lines(
+            [
+                # The test body is not interrupted the way an "error" filter
+                # would interrupt it.
+                "*body ran to completion*",
+                "*1 deferred warning:",
+                "*test_eager_fails_only_the_emitting_test.py:*: UserWarning: deferred me",
+            ]
+        )
+        assert result.ret == ExitCode.TESTS_FAILED
+
+    def test_summary_reports_at_the_end(self, pytester: Pytester) -> None:
+        self._emitting_test(pytester)
+
+        result = pytester.runpytest(
+            "-W", "defer::UserWarning", "-o", "deferred_warnings_report=summary"
+        )
+
+        result.assert_outcomes(passed=2, warnings=1)
+        result.stdout.fnmatch_lines(
+            [
+                "*= deferred warnings =*",
+                "*: UserWarning: deferred me",
+            ]
+        )
+        assert result.ret == ExitCode.DEFERRED_WARNINGS_ERROR
+
+    def test_not_deferred_without_a_matching_filter(self, pytester: Pytester) -> None:
+        self._emitting_test(pytester)
+
+        result = pytester.runpytest("-W", "defer::DeprecationWarning")
+
+        result.assert_outcomes(passed=2, warnings=1)
+        assert result.ret == ExitCode.OK
+
+    def test_higher_precedence_filter_wins(self, pytester: Pytester) -> None:
+        """A ``filterwarnings`` mark is applied last, so it beats the ini."""
+        pytester.makeini(
+            """
+            [pytest]
+            filterwarnings =
+                defer::UserWarning
+            """
+        )
+        pytester.makepyfile(
+            """
+            import warnings
+            import pytest
+
+            def test_deferred():
+                warnings.warn("boom", UserWarning)
+
+            @pytest.mark.filterwarnings("ignore::UserWarning")
+            def test_overridden():
+                warnings.warn("boom", UserWarning)
+            """
+        )
+
+        result = pytester.runpytest()
+
+        result.assert_outcomes(passed=1, failed=1, warnings=1)
+
+    def test_mark_can_defer_for_a_single_test(self, pytester: Pytester) -> None:
+        pytester.makeini(
+            """
+            [pytest]
+            filterwarnings =
+                always::UserWarning
+            """
+        )
+        pytester.makepyfile(
+            """
+            import warnings
+            import pytest
+
+            @pytest.mark.filterwarnings("defer::UserWarning")
+            def test_deferred():
+                warnings.warn("boom", UserWarning)
+
+            def test_unaffected():
+                warnings.warn("boom", UserWarning)
+            """
+        )
+
+        result = pytester.runpytest()
+
+        result.assert_outcomes(passed=1, failed=1, warnings=2)
+
+    def test_collection_warnings_are_reported_in_the_summary(
+        self, pytester: Pytester
+    ) -> None:
+        """Collection has no test phase to fail, so it reports at the end."""
+        pytester.makeini(
+            """
+            [pytest]
+            filterwarnings =
+                always::UserWarning
+            """
+        )
+        pytester.makepyfile(
+            """
+            import warnings
+            warnings.warn("at import time", UserWarning)
+
+            def test_pass():
+                pass
+            """
+        )
+
+        result = pytester.runpytest("-W", "defer::UserWarning")
+
+        result.assert_outcomes(passed=1, warnings=1)
+        result.stdout.fnmatch_lines(
+            ["*= deferred warnings =*", "*: UserWarning: at import time"]
+        )
+        assert result.ret == ExitCode.DEFERRED_WARNINGS_ERROR
+
+    def test_defer_rejects_module_and_line_fields(self, pytester: Pytester) -> None:
+        result = pytester.runpytest("-W", "defer::UserWarning:somemod")
+
+        assert result.ret == ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(
+            ["*the 'defer' action does not support the module and line fields*"]
+        )
+
+    def test_invalid_report_mode_is_a_usage_error(self, pytester: Pytester) -> None:
+        pytester.makepyfile("def test_pass(): pass")
+
+        result = pytester.runpytest("-o", "deferred_warnings_report=nonsense")
+
+        assert result.ret == ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(
+            ["*Invalid deferred_warnings_report value 'nonsense'*"]
+        )
+
+    def test_advises_about_defer_when_error_is_configured(
+        self, pytester: Pytester
+    ) -> None:
+        pytester.makepyfile("def test_pass(): pass")
+
+        result = pytester.runpytest("-W", "error")
+
+        result.stdout.fnmatch_lines(["warnings: 'error' filters configured;*"])
+
+    def test_no_advice_once_defer_is_used(self, pytester: Pytester) -> None:
+        pytester.makepyfile("def test_pass(): pass")
+
+        result = pytester.runpytest("-W", "error", "-W", "defer::UserWarning")
+
+        result.stdout.no_fnmatch_line("warnings: 'error' filters configured;*")
+
+    def test_no_advice_without_an_error_filter(self, pytester: Pytester) -> None:
+        pytester.makepyfile("def test_pass(): pass")
+
+        result = pytester.runpytest("-W", "always")
+
+        result.stdout.no_fnmatch_line("warnings: 'error' filters configured;*")

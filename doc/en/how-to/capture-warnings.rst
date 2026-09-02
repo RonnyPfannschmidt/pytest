@@ -327,6 +327,64 @@ See :ref:`@pytest.mark.filterwarnings <filterwarnings>` and
     by calling :func:`warnings.simplefilter` (see :issue:`2430` for an example of that).
 
 
+.. _`deferred-warnings`:
+
+Deferring warnings instead of erroring on them
+----------------------------------------------
+
+.. versionadded:: 9.0
+
+The ``error`` action raises at the :func:`warnings.warn` call site. That aborts the
+code under test halfway through, and the failure is reported at the frame that emitted
+the warning rather than where the test was going.
+
+pytest adds a ``defer`` action for the cases where that is not what you want. A
+deferred warning is recorded as usual, the code under test runs to completion, and
+pytest fails afterwards:
+
+.. tab:: pyproject.toml
+
+    .. code-block:: toml
+
+        [tool.pytest.ini_options]
+        filterwarnings = [
+            'defer::DeprecationWarning',
+        ]
+
+.. tab:: ini
+
+    .. code-block:: ini
+
+        [pytest]
+        filterwarnings =
+            defer::DeprecationWarning
+
+``defer`` is valid anywhere a warning filter is, including :option:`-W <pytest -W>` and
+:ref:`@pytest.mark.filterwarnings <filterwarnings>`, and follows the same precedence
+rules as every other action: the last matching filter wins.
+
+The :confval:`deferred_warnings_report` option decides where the failure shows up:
+
+* ``eager`` (the default) fails the test that emitted the warning, once that test's
+  current phase finishes.
+* ``summary`` lets the tests pass, lists the deferred warnings in a ``deferred warnings``
+  section at the end of the run, and exits with :class:`pytest.ExitCode`
+  ``DEFERRED_WARNINGS_ERROR`` (code ``7``).
+
+Warnings emitted where there is no test to fail -- during collection, for example --
+are always reported in the summary section.
+
+.. note::
+
+    Unlike the other actions, ``defer`` cannot be restricted by module or line::
+
+        filterwarnings = defer::DeprecationWarning:some.module   # UsageError
+
+    Deferral is resolved against the recorded warning, which carries the file the
+    warning came from rather than the emitting module's ``__name__``. Use the message
+    and category fields instead.
+
+
 .. _`ensuring a function triggers a deprecation warning`:
 
 .. _ensuring_function_triggers:

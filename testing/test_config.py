@@ -3084,6 +3084,17 @@ def test_strtobool() -> None:
         ),
         ("error:some\\msg:::", True, ("error", "some\\\\msg", Warning, "", 0)),
         ("error:::mod\\foo:", True, ("error", "", Warning, "mod\\\\foo\\Z", 0)),
+        ("defer", False, ("defer", "", Warning, "", 0)),
+        (
+            "defer::DeprecationWarning",
+            False,
+            ("defer", "", DeprecationWarning, "", 0),
+        ),
+        (
+            "defer:some msg:DeprecationWarning",
+            False,
+            ("defer", "some msg", DeprecationWarning, "", 0),
+        ),
     ],
 )
 def test_parse_warning_filter(
@@ -3105,6 +3116,9 @@ def test_parse_warning_filter(
         "::::-1",
         # Not a line number.
         "::::not-a-number",
+        # "defer" cannot be resolved against a module or a line (#14912).
+        "defer::DeprecationWarning:mod",
+        "defer::DeprecationWarning::42",
     ],
 )
 def test_parse_warning_filter_failure(arg: str) -> None:
