@@ -1155,8 +1155,8 @@ def test_pythonwarnings_not_duplicated(pytester: Pytester) -> None:
     assert warnings_list == ["error"]
 
 
-class TestDeferredWarnings:
-    """The ``defer`` filter action (#14912)."""
+class TestErrorLaterWarnings:
+    """The ``error_later`` filter action (#14912)."""
 
     def _emitting_test(self, pytester: Pytester) -> None:
         # In-process pytester runs inherit the filters of the outer session,
@@ -1173,7 +1173,7 @@ class TestDeferredWarnings:
             import warnings
 
             def test_emits():
-                warnings.warn("deferred me", UserWarning)
+                warnings.warn("too late", UserWarning)
                 print("body ran to completion")
 
             def test_clean():
@@ -1181,10 +1181,10 @@ class TestDeferredWarnings:
             """
         )
 
-    def test_eager_fails_only_the_emitting_test(self, pytester: Pytester) -> None:
+    def test_test_mode_fails_only_the_emitting_test(self, pytester: Pytester) -> None:
         self._emitting_test(pytester)
 
-        result = pytester.runpytest("-W", "defer::UserWarning", "-s")
+        result = pytester.runpytest("-W", "error_later::UserWarning", "-s")
 
         result.assert_outcomes(passed=1, failed=1, warnings=1)
         result.stdout.fnmatch_lines(
@@ -1192,32 +1192,32 @@ class TestDeferredWarnings:
                 # The test body is not interrupted the way an "error" filter
                 # would interrupt it.
                 "*body ran to completion*",
-                "*1 deferred warning:",
-                "*test_eager_fails_only_the_emitting_test.py:*: UserWarning: deferred me",
+                "*1 warning matched an 'error_later' filter:",
+                "*test_test_mode_fails_only_the_emitting_test.py:*: UserWarning: too late",
             ]
         )
         assert result.ret == ExitCode.TESTS_FAILED
 
-    def test_summary_reports_at_the_end(self, pytester: Pytester) -> None:
+    def test_session_mode_reports_at_the_end(self, pytester: Pytester) -> None:
         self._emitting_test(pytester)
 
         result = pytester.runpytest(
-            "-W", "defer::UserWarning", "-o", "deferred_warnings_report=summary"
+            "-W", "error_later::UserWarning", "-o", "error_later_report=session"
         )
 
         result.assert_outcomes(passed=2, warnings=1)
         result.stdout.fnmatch_lines(
             [
-                "*= deferred warnings =*",
-                "*: UserWarning: deferred me",
+                "*= late warning errors =*",
+                "*: UserWarning: too late",
             ]
         )
-        assert result.ret == ExitCode.DEFERRED_WARNINGS_ERROR
+        assert result.ret == ExitCode.LATE_WARNING_ERROR
 
-    def test_not_deferred_without_a_matching_filter(self, pytester: Pytester) -> None:
+    def test_not_matched_by_a_different_category(self, pytester: Pytester) -> None:
         self._emitting_test(pytester)
 
-        result = pytester.runpytest("-W", "defer::DeprecationWarning")
+        result = pytester.runpytest("-W", "error_later::DeprecationWarning")
 
         result.assert_outcomes(passed=2, warnings=1)
         assert result.ret == ExitCode.OK
@@ -1228,7 +1228,7 @@ class TestDeferredWarnings:
             """
             [pytest]
             filterwarnings =
-                defer::UserWarning
+                error_later::UserWarning
             """
         )
         pytester.makepyfile(
@@ -1236,7 +1236,7 @@ class TestDeferredWarnings:
             import warnings
             import pytest
 
-            def test_deferred():
+            def test_errors_late():
                 warnings.warn("boom", UserWarning)
 
             @pytest.mark.filterwarnings("ignore::UserWarning")
@@ -1249,7 +1249,7 @@ class TestDeferredWarnings:
 
         result.assert_outcomes(passed=1, failed=1, warnings=1)
 
-    def test_mark_can_defer_for_a_single_test(self, pytester: Pytester) -> None:
+    def test_mark_can_apply_to_a_single_test(self, pytester: Pytester) -> None:
         pytester.makeini(
             """
             [pytest]
@@ -1262,8 +1262,8 @@ class TestDeferredWarnings:
             import warnings
             import pytest
 
-            @pytest.mark.filterwarnings("defer::UserWarning")
-            def test_deferred():
+            @pytest.mark.filterwarnings("error_later::UserWarning")
+            def test_errors_late():
                 warnings.warn("boom", UserWarning)
 
             def test_unaffected():
@@ -1275,7 +1275,7 @@ class TestDeferredWarnings:
 
         result.assert_outcomes(passed=1, failed=1, warnings=2)
 
-    def test_collection_warnings_are_reported_in_the_summary(
+    def test_collection_warnings_are_reported_at_the_end(
         self, pytester: Pytester
     ) -> None:
         """Collection has no test phase to fail, so it reports at the end."""
@@ -1296,33 +1296,31 @@ class TestDeferredWarnings:
             """
         )
 
-        result = pytester.runpytest("-W", "defer::UserWarning")
+        result = pytester.runpytest("-W", "error_later::UserWarning")
 
         result.assert_outcomes(passed=1, warnings=1)
         result.stdout.fnmatch_lines(
-            ["*= deferred warnings =*", "*: UserWarning: at import time"]
+            ["*= late warning errors =*", "*: UserWarning: at import time"]
         )
-        assert result.ret == ExitCode.DEFERRED_WARNINGS_ERROR
+        assert result.ret == ExitCode.LATE_WARNING_ERROR
 
-    def test_defer_rejects_module_and_line_fields(self, pytester: Pytester) -> None:
-        result = pytester.runpytest("-W", "defer::UserWarning:somemod")
+    def test_rejects_module_and_line_fields(self, pytester: Pytester) -> None:
+        result = pytester.runpytest("-W", "error_later::UserWarning:somemod")
 
         assert result.ret == ExitCode.USAGE_ERROR
         result.stderr.fnmatch_lines(
-            ["*the 'defer' action does not support the module and line fields*"]
+            ["*the 'error_later' action does not support the module and line fields*"]
         )
 
     def test_invalid_report_mode_is_a_usage_error(self, pytester: Pytester) -> None:
         pytester.makepyfile("def test_pass(): pass")
 
-        result = pytester.runpytest("-o", "deferred_warnings_report=nonsense")
+        result = pytester.runpytest("-o", "error_later_report=nonsense")
 
         assert result.ret == ExitCode.USAGE_ERROR
-        result.stderr.fnmatch_lines(
-            ["*Invalid deferred_warnings_report value 'nonsense'*"]
-        )
+        result.stderr.fnmatch_lines(["*Invalid error_later_report value 'nonsense'*"])
 
-    def test_advises_about_defer_when_error_is_configured(
+    def test_advises_about_error_later_when_error_is_configured(
         self, pytester: Pytester
     ) -> None:
         pytester.makepyfile("def test_pass(): pass")
@@ -1331,10 +1329,10 @@ class TestDeferredWarnings:
 
         result.stdout.fnmatch_lines(["warnings: 'error' filters configured;*"])
 
-    def test_no_advice_once_defer_is_used(self, pytester: Pytester) -> None:
+    def test_no_advice_once_error_later_is_used(self, pytester: Pytester) -> None:
         pytester.makepyfile("def test_pass(): pass")
 
-        result = pytester.runpytest("-W", "error", "-W", "defer::UserWarning")
+        result = pytester.runpytest("-W", "error", "-W", "error_later::UserWarning")
 
         result.stdout.no_fnmatch_line("warnings: 'error' filters configured;*")
 

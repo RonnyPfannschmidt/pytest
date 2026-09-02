@@ -327,10 +327,10 @@ See :ref:`@pytest.mark.filterwarnings <filterwarnings>` and
     by calling :func:`warnings.simplefilter` (see :issue:`2430` for an example of that).
 
 
-.. _`deferred-warnings`:
+.. _`error-later-warnings`:
 
-Deferring warnings instead of erroring on them
-----------------------------------------------
+Erroring on warnings after the test instead of during it
+---------------------------------------------------------
 
 .. versionadded:: 9.0
 
@@ -338,9 +338,9 @@ The ``error`` action raises at the :func:`warnings.warn` call site. That aborts 
 code under test halfway through, and the failure is reported at the frame that emitted
 the warning rather than where the test was going.
 
-pytest adds a ``defer`` action for the cases where that is not what you want. A
-deferred warning is recorded as usual, the code under test runs to completion, and
-pytest fails afterwards:
+pytest adds an ``error_later`` action for the cases where that is not what you want.
+The warning still becomes an error, but it is recorded first: the code under test runs
+to completion, and pytest raises afterwards.
 
 .. tab:: pyproject.toml
 
@@ -348,7 +348,7 @@ pytest fails afterwards:
 
         [tool.pytest.ini_options]
         filterwarnings = [
-            'defer::DeprecationWarning',
+            'error_later::DeprecationWarning',
         ]
 
 .. tab:: ini
@@ -357,30 +357,30 @@ pytest fails afterwards:
 
         [pytest]
         filterwarnings =
-            defer::DeprecationWarning
+            error_later::DeprecationWarning
 
-``defer`` is valid anywhere a warning filter is, including :option:`-W <pytest -W>` and
+``error_later`` is valid anywhere a warning filter is, including :option:`-W <pytest -W>` and
 :ref:`@pytest.mark.filterwarnings <filterwarnings>`, and follows the same precedence
 rules as every other action: the last matching filter wins.
 
-The :confval:`deferred_warnings_report` option decides where the failure shows up:
+The :confval:`error_later_report` option decides what fails:
 
-* ``eager`` (the default) fails the test that emitted the warning, once that test's
+* ``test`` (the default) fails the test that emitted the warning, once that test's
   current phase finishes.
-* ``summary`` lets the tests pass, lists the deferred warnings in a ``deferred warnings``
+* ``session`` lets the tests pass, lists the warnings in a ``late warning errors``
   section at the end of the run, and exits with :class:`pytest.ExitCode`
-  ``DEFERRED_WARNINGS_ERROR`` (code ``7``).
+  ``LATE_WARNING_ERROR`` (code ``7``).
 
 Warnings emitted where there is no test to fail -- during collection, for example --
-are always reported in the summary section.
+always end up in that end-of-run section.
 
 .. note::
 
-    Unlike the other actions, ``defer`` cannot be restricted by module or line::
+    Unlike the other actions, ``error_later`` cannot be restricted by module or line::
 
-        filterwarnings = defer::DeprecationWarning:some.module   # UsageError
+        filterwarnings = error_later::DeprecationWarning:some.module   # UsageError
 
-    Deferral is resolved against the recorded warning, which carries the file the
+    The action is resolved against the recorded warning, which carries the file the
     warning came from rather than the emitting module's ``__name__``. Use the message
     and category fields instead.
 

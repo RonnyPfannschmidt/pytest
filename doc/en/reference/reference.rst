@@ -1704,34 +1704,33 @@ passed multiple times. The expected format is ``name=value``. For example::
    into errors. For more information please refer to :ref:`warnings`.
 
 
-.. confval:: deferred_warnings_report
-   :type: ``"eager" | "summary"``
-   :default: ``"eager"``
+.. confval:: error_later_report
+   :type: ``"test" | "session"``
+   :default: ``"test"``
 
    .. versionadded:: 9.0
 
-   Where warnings matching a ``defer`` filter are reported.
+   What a warning matching an ``error_later`` filter fails.
 
-   ``eager`` fails the test that emitted the warning, once that test's current phase
-   finishes. ``summary`` lets the tests pass, lists the deferred warnings at the end of
-   the run and exits with :class:`pytest.ExitCode` ``DEFERRED_WARNINGS_ERROR``
-   (code ``7``).
+   ``test`` fails the test that emitted the warning, once that test's current phase
+   finishes. ``session`` lets the tests pass, lists the warnings at the end of the run
+   and exits with :class:`pytest.ExitCode` ``LATE_WARNING_ERROR`` (code ``7``).
 
    .. tab:: toml
 
        .. code-block:: toml
 
             [tool.pytest.ini_options]
-            deferred_warnings_report = "summary"
+            error_later_report = "session"
 
    .. tab:: ini
 
        .. code-block:: ini
 
             [pytest]
-            deferred_warnings_report = summary
+            error_later_report = session
 
-   See :ref:`deferred-warnings` for more information.
+   See :ref:`error-later-warnings` for more information.
 
 
 .. confval:: max_warnings

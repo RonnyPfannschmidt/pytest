@@ -78,11 +78,11 @@ from _pytest.pathlib import ImportMode
 from _pytest.pathlib import resolve_package_path
 from _pytest.pathlib import safe_exists
 from _pytest.stash import Stash
-from _pytest.warning_defer import DEFER_ACTION
-from _pytest.warning_defer import defer_state_key
-from _pytest.warning_defer import DeferState
-from _pytest.warning_defer import install_warning_filter
-from _pytest.warning_defer import WarningFilter
+from _pytest.warning_late_error import ERROR_LATER_ACTION
+from _pytest.warning_late_error import install_warning_filter
+from _pytest.warning_late_error import late_warning_state_key
+from _pytest.warning_late_error import LateWarningState
+from _pytest.warning_late_error import WarningFilter
 from _pytest.warning_types import PytestConfigWarning
 from _pytest.warning_types import warn_explicit_for
 
@@ -129,8 +129,8 @@ class ExitCode(enum.IntEnum):
     NO_TESTS_COLLECTED = 5
     #: All tests pass, but maximum number of warnings exceeded.
     MAX_WARNINGS_ERROR = 6
-    #: All tests pass, but warnings matching a ``defer`` filter were emitted.
-    DEFERRED_WARNINGS_ERROR = 7
+    #: All tests pass, but warnings matching an ``error_later`` filter were emitted.
+    LATE_WARNING_ERROR = 7
 
     __module__ = "pytest"
 
@@ -1298,7 +1298,7 @@ class Config:
             applied = apply_warning_filters(config_filters, cmdline_filters)
             # Mirror the save/restore that ``catch_warnings`` does for
             # ``warnings.filters``, so nested contexts see the right filters.
-            state = self.stash.setdefault(defer_state_key, DeferState())
+            state = self.stash.setdefault(late_warning_state_key, LateWarningState())
             previous_filters = state.filters
             state.filters = applied
             try:
@@ -2374,19 +2374,19 @@ def parse_warning_filter(arg: str, *, escape: bool) -> WarningFilter:
     while len(parts) < 5:
         parts.append("")
     action_, message, category_, module, lineno_ = (s.strip() for s in parts)
-    action: warnings._ActionKind | Literal["defer"]
-    if action_ == DEFER_ACTION:
-        # Deferral is decided against a recorded warning, which carries the
+    action: warnings._ActionKind | Literal["error_later"]
+    if action_ == ERROR_LATER_ACTION:
+        # The action is resolved against a recorded warning, which carries the
         # emitting file rather than the emitting module's __name__, so the
         # module and line fields cannot be honoured.
         if module or lineno_:
             raise UsageError(
                 error_template.format(
-                    error=f"the {DEFER_ACTION!r} action does not support the module "
-                    f"and line fields; use {DEFER_ACTION}:message:category instead\n"
+                    error=f"the {ERROR_LATER_ACTION!r} action does not support the module "
+                    f"and line fields; use {ERROR_LATER_ACTION}:message:category instead\n"
                 )
             )
-        action = DEFER_ACTION
+        action = ERROR_LATER_ACTION
     else:
         try:
             action = warnings._getaction(action_)  # type: ignore[attr-defined]
@@ -2453,7 +2453,7 @@ def apply_warning_filters(
     """Applies pytest-configured filters to the warnings module.
 
     Returns the filters that were applied, in application order, so that the
-    ``defer`` action can resolve precedence the way ``warnings.filters`` does.
+    ``error_later`` action can resolve precedence the way ``warnings.filters`` does.
     """
     applied: list[WarningFilter] = []
     # Filters should have this precedence: cmdline options, config.

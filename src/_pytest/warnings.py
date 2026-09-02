@@ -17,13 +17,13 @@ from _pytest.outcomes import fail
 from _pytest.stash import StashKey
 from _pytest.terminal import TerminalReporter
 from _pytest.tracemalloc import tracemalloc_message
-from _pytest.warning_defer import DEFER_ACTION
-from _pytest.warning_defer import defer_state_key
-from _pytest.warning_defer import DeferredWarning
-from _pytest.warning_defer import DeferState
-from _pytest.warning_defer import install_warning_filter
-from _pytest.warning_defer import should_defer
-from _pytest.warning_defer import to_deferred
+from _pytest.warning_late_error import ERROR_LATER_ACTION
+from _pytest.warning_late_error import install_warning_filter
+from _pytest.warning_late_error import late_warning_state_key
+from _pytest.warning_late_error import LateWarning
+from _pytest.warning_late_error import LateWarningState
+from _pytest.warning_late_error import should_error_later
+from _pytest.warning_late_error import to_late_warning
 import pytest
 
 
@@ -45,7 +45,7 @@ def catch_warnings_for_item(
     with config._catch_configured_warnings(record=record) as log:
         # apply filters from "filterwarnings" marks
         nodeid = "" if item is None else item.nodeid
-        state = config.stash.setdefault(defer_state_key, DeferState())
+        state = config.stash.setdefault(late_warning_state_key, LateWarningState())
         if item is not None:
             for mark in item.iter_markers(name="filterwarnings"):
                 for arg in mark.args:
@@ -95,50 +95,53 @@ class _Recording:
 _recordings_key: StashKey[list[_Recording]] = StashKey()
 
 
-def _drain(config: Config, recording: _Recording) -> list[DeferredWarning]:
-    """Take the deferred warnings recorded since the last drain."""
-    state = config.stash[defer_state_key]
-    deferred = [
-        to_deferred(warning_message, recording.nodeid)
+def _drain(config: Config, recording: _Recording) -> list[LateWarning]:
+    """Take the warnings recorded since the last drain that must error later."""
+    state = config.stash[late_warning_state_key]
+    late = [
+        to_late_warning(warning_message, recording.nodeid)
         for warning_message in recording.log[recording.cursor :]
-        if should_defer(warning_message, state.filters)
+        if should_error_later(warning_message, state.filters)
     ]
     recording.cursor = len(recording.log)
-    return deferred
+    return late
 
 
-def _collect_deferred(item: Item) -> None:
-    """Fail the current test phase if it produced deferred warnings."""
+def _collect_late_warnings(item: Item) -> None:
+    """Fail the current test phase for any warning that must error later."""
     __tracebackhide__ = True
     recordings = item.config.stash.get(_recordings_key, None)
     if not recordings:
         return
-    deferred = _drain(item.config, recordings[-1])
-    if not deferred:
+    late = _drain(item.config, recordings[-1])
+    if not late:
         return
-    if _deferred_report_mode(item.config) == "summary":
-        item.config.stash[defer_state_key].collected.extend(deferred)
+    if _error_later_report_mode(item.config) == "session":
+        item.config.stash[late_warning_state_key].collected.extend(late)
         return
-    plural = "s" if len(deferred) > 1 else ""
-    lines = "\n".join(w.format() for w in deferred)
+    plural = "s" if len(late) > 1 else ""
+    lines = "\n".join(w.format() for w in late)
     # The warning's own location is in the message; the frames between here and
     # the emitting code are pytest's, so there is no traceback worth showing.
-    fail(f"{len(deferred)} deferred warning{plural}:\n{lines}", pytrace=False)
+    fail(
+        f"{len(late)} warning{plural} matched an 'error_later' filter:\n{lines}",
+        pytrace=False,
+    )
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_setup(item: Item) -> None:
-    _collect_deferred(item)
+    _collect_late_warnings(item)
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_call(item: Item) -> None:
-    _collect_deferred(item)
+    _collect_late_warnings(item)
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item: Item) -> None:
-    _collect_deferred(item)
+    _collect_late_warnings(item)
 
 
 def warning_record_to_str(warning_message: warnings.WarningMessage) -> str:
@@ -189,25 +192,25 @@ def pytest_sessionfinish(session: Session) -> Generator[None]:
         try:
             return (yield)
         finally:
-            _report_deferred_warnings(session)
+            _report_late_warnings(session)
 
 
-def _report_deferred_warnings(session: Session) -> None:
-    """Report deferred warnings that no test phase could be failed for.
+def _report_late_warnings(session: Session) -> None:
+    """Error on the warnings that no test phase could be failed for.
 
-    Under ``summary`` this is every deferred warning; under ``eager`` it is the
-    ones raised outside a test phase, such as during collection.
+    Under ``session`` that is every one of them; under ``test`` it is the ones
+    emitted outside a test phase, such as during collection.
     """
-    state = session.config.stash.get(defer_state_key, None)
+    state = session.config.stash.get(late_warning_state_key, None)
     if state is None or not state.collected:
         return
     terminalreporter = session.config.pluginmanager.getplugin("terminalreporter")
     if terminalreporter is not None:
-        terminalreporter.write_sep("=", "deferred warnings", yellow=True, bold=True)
-        for deferred in state.collected:
-            terminalreporter.write_line(deferred.format(with_nodeid=True))
+        terminalreporter.write_sep("=", "late warning errors", yellow=True, bold=True)
+        for late in state.collected:
+            terminalreporter.write_line(late.format(with_nodeid=True))
     if session.exitstatus == ExitCode.OK:
-        session.exitstatus = ExitCode.DEFERRED_WARNINGS_ERROR
+        session.exitstatus = ExitCode.LATE_WARNING_ERROR
 
 
 @pytest.hookimpl(wrapper=True)
@@ -220,21 +223,21 @@ def pytest_load_initial_conftests(
         return (yield)
 
 
-DEFERRED_REPORT_MODES = ("eager", "summary")
+LATE_ERROR_REPORT_MODES = ("test", "session")
 
 
-def _deferred_report_mode(config: Config) -> str:
-    mode: str = config.getini("deferred_warnings_report")
-    if mode not in DEFERRED_REPORT_MODES:
+def _error_later_report_mode(config: Config) -> str:
+    mode: str = config.getini("error_later_report")
+    if mode not in LATE_ERROR_REPORT_MODES:
         raise UsageError(
-            f"Invalid deferred_warnings_report value {mode!r}, "
-            f"expected one of {', '.join(DEFERRED_REPORT_MODES)}"
+            f"Invalid error_later_report value {mode!r}, "
+            f"expected one of {', '.join(LATE_ERROR_REPORT_MODES)}"
         )
     return mode
 
 
 def pytest_report_header(config: Config) -> str | None:
-    """Point users configuring ``error`` filters at the ``defer`` action.
+    """Point users configuring ``error`` filters at the ``error_later`` action.
 
     Erroring at the ``warnings.warn()`` call site stays a perfectly good choice,
     so this is advice rather than a warning -- and it is not itself emitted
@@ -253,17 +256,17 @@ def pytest_report_header(config: Config) -> str | None:
             except Exception:
                 # Reported properly when the filters are applied.
                 continue
-    if "error" not in actions or DEFER_ACTION in actions:
+    if "error" not in actions or ERROR_LATER_ACTION in actions:
         return None
     return (
-        "warnings: 'error' filters configured; the 'defer' action instead reports "
-        "them once the test finishes, see --help for deferred_warnings_report"
+        "warnings: 'error' filters configured; 'error_later' errors on them once the "
+        "test finishes instead of inside it, see --help for error_later_report"
     )
 
 
 def pytest_configure(config: Config) -> None:
-    # Fail early on a bad value rather than once a test defers a warning.
-    _deferred_report_mode(config)
+    # Fail early on a bad value rather than once a warning matches the filter.
+    _error_later_report_mode(config)
     config.addinivalue_line(
         "markers",
         "filterwarnings(warning): add a warning filter to the given test. "
