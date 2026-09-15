@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from collections.abc import Generator
 import importlib.metadata
+from pathlib import Path
 import re
 import sys
 
 from packaging.version import Version
 
+from _pytest.ensemble import make_tmp_path_factory
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.pytester import Pytester
+from _pytest.tmpdir import TempPathFactory
 import pytest
 
 
@@ -89,6 +92,17 @@ def pytest_collection_modifyitems(items) -> Generator[None]:
     items[:] = fast_items + neutral_items + slow_items + slowest_items
 
     return (yield)
+
+
+@pytest.fixture
+def ensemble_tmp_path_factory(tmp_path: Path) -> TempPathFactory:
+    """A ``TempPathFactory`` for an ensemble, rooted in this test's tmp_path.
+
+    Pass it as ``ConfigSpec.tmp_path_factory`` to give the ensemble a working
+    ``tmp_path`` fixture. The directory belongs to the host test, so it needs
+    no base temp allocation of its own and is cleaned up with the host's.
+    """
+    return make_tmp_path_factory(tmp_path / "ensemble-tmp")
 
 
 @pytest.fixture
