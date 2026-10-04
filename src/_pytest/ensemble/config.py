@@ -14,11 +14,14 @@ import warnings
 
 from _pytest.config import Config
 from _pytest.config import essential_plugins
+from _pytest.config import hookimpl
 from _pytest.config import PytestPluginManager
 from _pytest.config.findpaths import ConfigValue
 from _pytest.config.findpaths import parse_override_ini
 from _pytest.stash import StashKey
 from _pytest.terminal import terminal_file_key
+from _pytest.tmpdir import TempPathFactory
+from _pytest.unraisableexception import gc_collect_iterations_key
 
 
 #: Warnings raised while the ensemble config was being configured or
@@ -33,6 +36,12 @@ config_warnings_key = StashKey[list[warnings.WarningMessage]]()
 #: excluding everything that renders output, captures io, or installs
 #: process-global state (terminal, capture, cacheprovider, assertion,
 #: debugging, faulthandler, logging, threadexception, unraisableexception, ...).
+#:
+#: ``tmpdir`` is not here either: it would allocate the ensemble its own
+#: numbered base temp directory under the global ``pytest-of-<user>`` root,
+#: which means scanning that root once per ensemble and leaving a directory
+#: behind for every one ever configured. It is loaded only when
+#: :attr:`ConfigSpec.tmp_path_factory` supplies a preconfigured factory.
 DEFAULT_PLUGINS: Final[tuple[str, ...]] = (
     *essential_plugins,  # mark, main, runner, fixtures, helpconfig
     "python",
@@ -42,7 +51,6 @@ DEFAULT_PLUGINS: Final[tuple[str, ...]] = (
     "unittest",
     "monkeypatch",
     "recwarn",
-    "tmpdir",
     # Not for the rewriting - that is installed from Config._preparse, which
     # an ensemble never runs - but for the failure *explanation*. Without
     # this plugin ``assertion.util._reprcompare`` stays bound to whatever the
@@ -86,6 +94,23 @@ class ConfigSpec:
     #: Not supported yet; ensemble configs never load conftest files.
     load_conftests: bool = False
 
+    #: Preconfigured temp path factory. Supplying one loads the ``tmpdir``
+    #: plugin and binds this factory instead of the one it would build from
+    #: the config, so an ensemble's ``tmp_path`` lives wherever the caller
+    #: decided - normally inside the *host* test's own ``tmp_path``, which
+    #: costs no root scan and is cleaned up with the host. Build one with
+    #: :func:`make_tmp_path_factory`.
+    tmp_path_factory: TempPathFactory | None = None
+
+    #: How many ``gc.collect()`` passes ``unraisableexception`` makes, when
+    #: that plugin is opted into at all. It is not in :data:`DEFAULT_PLUGINS`,
+    #: and even when loaded an ensemble does not collect by default: the heap
+    #: it would walk is the *host* process's, so a full pass costs whatever
+    #: the host happens to be holding rather than anything the ensemble owns.
+    #: Raise it only for a test that needs finalizers flushed before an
+    #: unraisable exception can surface.
+    gc_collect_iterations: int = 0
+
     #: Stream the terminal plugin writes to, when it is loaded at all. An
     #: ensemble must never be given the stdout of whatever is running it,
     #: so this is bound at construction rather than redirected around it.
@@ -114,6 +139,46 @@ class ConfigSpec:
     def without_plugins(self, *names: str) -> ConfigSpec:
         """Return a spec with the given built-in plugin names removed."""
         return self.replace(plugins=tuple(p for p in self.plugins if p not in names))
+
+
+def make_tmp_path_factory(basetemp: pathlib.Path) -> TempPathFactory:
+    """Build a :class:`TempPathFactory` for an ensemble, rooted at *basetemp*.
+
+    *basetemp* is treated the way ``--basetemp`` is: it is removed if it
+    already exists, then created. Pass a path that is yours to destroy - a
+    subdirectory of the host test's ``tmp_path`` is the intended use.
+
+    The point is what this does *not* do. A factory built from a config
+    allocates a numbered directory under the global ``pytest-of-<user>``
+    root, which scans that root and every sibling run's leftovers, registers
+    a cleanup lock, and leaves the directory behind afterwards. Ensembles are
+    built in the hundreds, so paying that per ensemble is not viable.
+    """
+    return TempPathFactory(
+        given_basetemp=basetemp,
+        trace=lambda *args, **kwargs: None,
+        retention_count=0,
+        retention_policy="all",
+        _ispytest=True,
+    )
+
+
+class _BindTmpPathFactory:
+    """Bind a caller-supplied factory over the one ``tmpdir`` builds.
+
+    The ``tmpdir`` plugin creates its factory in ``pytest_configure``; this
+    runs last and replaces it, so the fixtures, the retention handling and
+    the ``pytest_sessionfinish`` cleanup all stay the plugin's own.
+    """
+
+    __pytest_no_fixtures__ = True
+
+    def __init__(self, factory: TempPathFactory) -> None:
+        self._factory = factory
+
+    @hookimpl(trylast=True)
+    def pytest_configure(self, config: Config) -> None:
+        config._tmp_path_factory = self._factory  # type: ignore[attr-defined]
 
 
 def _own(value: object) -> ConfigValue:
@@ -176,6 +241,9 @@ def configured(spec: ConfigSpec) -> Iterator[Config]:
     try:
         for name in spec.plugins:
             pluginmanager.import_plugin(name)
+        if spec.tmp_path_factory is not None:
+            pluginmanager.import_plugin("tmpdir")
+            pluginmanager.register(_BindTmpPathFactory(spec.tmp_path_factory))
         for plugin in spec.extra_plugins:
             if isinstance(plugin, str):
                 pluginmanager.import_plugin(plugin)
@@ -209,6 +277,9 @@ def configured(spec: ConfigSpec) -> Iterator[Config]:
             config._inicache.clear()
 
         config._finalize_parse(args, decide_args=False)
+        # Read by ``unraisableexception`` at configure, cleanup and
+        # unconfigure time; harmless when that plugin was not opted into.
+        config.stash[gc_collect_iterations_key] = spec.gc_collect_iterations
         if spec.output is not None:
             # Must be stashed before configure: the terminal reporter binds
             # its stream when it is constructed, and must never bind ours.

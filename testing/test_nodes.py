@@ -6,6 +6,8 @@ import re
 import warnings
 
 from _pytest import nodes
+from _pytest.ensemble import collect_tests
+from _pytest.ensemble import Ensemble
 from _pytest.outcomes import OutcomeException
 from _pytest.pytester import Pytester
 from _pytest.warning_types import PytestWarning
@@ -66,25 +68,22 @@ def test_subclassing_both_item_and_collector_deprecated(
     "warn_type, msg", [(DeprecationWarning, "deprecated"), (PytestWarning, "pytest")]
 )
 def test_node_warn_is_no_longer_only_pytest_warnings(
-    pytester: Pytester, warn_type: type[Warning], msg: str
+    tmp_path: Path, warn_type: type[Warning], msg: str
 ) -> None:
-    items = pytester.getitems(
-        """
-        def test():
-            pass
-    """
-    )
-    with pytest.warns(warn_type, match=msg):
-        items[0].warn(warn_type(msg))
+    def test() -> None:
+        pass
+
+    with Ensemble(test, rootpath=tmp_path) as ensemble:
+        items = ensemble.collect()
+        with pytest.warns(warn_type, match=msg):
+            items[0].warn(warn_type(msg))
 
 
-def test_node_warning_enforces_warning_types(pytester: Pytester) -> None:
-    items = pytester.getitems(
-        """
-        def test():
-            pass
-    """
-    )
+def test_node_warning_enforces_warning_types(tmp_path: Path) -> None:
+    def test() -> None:
+        pass
+
+    items = collect_tests(test, rootpath=tmp_path)
     with pytest.raises(
         ValueError, match="warning must be an instance of Warning or subclass"
     ):
