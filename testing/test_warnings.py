@@ -1429,6 +1429,59 @@ class TestErrorLaterWarnings:
         assert result.ret == ExitCode.OK
         result.stdout.fnmatch_lines(["*1 passed, 1 warning*"])
 
+    def test_showwarning_forwarder_preserves_late_verdict(
+        self, pytester: Pytester
+    ) -> None:
+        pytester.makepyfile(
+            """
+            import warnings
+
+            def test_it():
+                original = warnings.showwarning
+
+                def forward(*args, **kwargs):
+                    original(*args, **kwargs)
+
+                warnings.showwarning = forward
+                try:
+                    warnings.warn("forwarded", UserWarning)
+                finally:
+                    warnings.showwarning = original
+            """
+        )
+
+        result = pytester.runpytest("-W", "error_later::UserWarning")
+
+        result.assert_outcomes(failed=1, warnings=1)
+        result.stdout.fnmatch_lines(
+            ["*1 warning matched an 'error_later' filter:", "*UserWarning: forwarded"]
+        )
+
+    def test_showwarning_that_discards_does_not_leak_late_verdict(
+        self, pytester: Pytester
+    ) -> None:
+        pytester.makepyfile(
+            """
+            import warnings
+
+            def test_it():
+                original = warnings.showwarning
+                warnings.showwarning = lambda *args, **kwargs: None
+                try:
+                    warnings.warn("discarded", UserWarning)
+                finally:
+                    warnings.showwarning = original
+                warnings.warn("recorded", DeprecationWarning)
+            """
+        )
+
+        result = pytester.runpytest(
+            "-W", "error_later::UserWarning", "-W", "always::DeprecationWarning"
+        )
+
+        result.assert_outcomes(passed=1, warnings=1)
+        result.stdout.fnmatch_lines(["*DeprecationWarning: recorded"])
+
     def test_invalid_report_mode_is_a_usage_error(self, pytester: Pytester) -> None:
         pytester.makepyfile("def test_pass(): pass")
 

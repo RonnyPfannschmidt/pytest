@@ -84,24 +84,28 @@ late_warning_state_key: StashKey[LateWarningState] = StashKey()
 # ---------------------------------------------------------
 #
 # An ``error_later`` filter is installed as a real ``always`` filter whose
-# module field is a _WinProbe, immediately followed by a never-matching filter
-# whose module field is a _LossProbe. The warnings module calls ``.match()`` on
+# message and module fields hold probes, immediately followed by a
+# never-matching filter whose module field is a _LossProbe. A never-matching
+# _ClearProbe precedes the pair. The warnings module calls ``.match()`` on
 # whatever object sits in the message and module fields of every filter it
 # visits (Python/_warnings.c:check_matched, and ``mod.match(module)`` in the
 # pure-Python warn_explicit), and stops at the first filter that matches. So
 # for each warning:
 #
-# - the win probe sees the exact module name the stdlib matches against;
+# - the clear probe withdraws a verdict left by a showwarning hook that did not
+#   forward the preceding warning;
+# - the message and win probes see the exact text and module name the stdlib
+#   matches against;
 # - if its filter wins, the search stops and the warning is shown next, in
 #   the same thread, before anything else can run;
 # - if its filter loses on a later field (category and line are checked after
 #   the module in C), the search goes on to the loss probe, which withdraws it.
 #
 # The verdict is handed over through a thread-local and consumed by pytest's
-# recording log or showwarning wrapper. The win probe only records when one of
-# those is where the warning will go, so a warning shown elsewhere (pytest.warns,
-# a test's own catch_warnings, logging.captureWarnings) leaves nothing behind
-# for the next warning to pick up.
+# recording log or showwarning wrapper. The message text guards against a
+# custom showwarning hook leaving a verdict behind when it does not forward the
+# warning. Warnings taken by pytest.warns or the test's own catch_warnings do
+# not reach pytest's recording and are cleared by the next probe.
 
 _verdict = threading.local()
 
@@ -109,10 +113,17 @@ _verdict = threading.local()
 _CONTEXT_AWARE: Final = bool(getattr(sys.flags, "context_aware_warnings", False))
 
 
-def _take_verdict() -> str | None:
+def _clear_verdict() -> None:
+    _verdict.match = None
+
+
+def _take_verdict(message: Warning | str) -> str | None:
     """The module name of a warning an ``error_later`` filter just won, once."""
-    module: str | None = getattr(_verdict, "module", None)
-    _verdict.module = None
+    match: tuple[str, str] | None = getattr(_verdict, "match", None)
+    _clear_verdict()
+    if match is None or match[1] != str(message):
+        return None
+    module = match[0]
     return module
 
 
@@ -129,7 +140,7 @@ class LateWarningLog(list[warnings.WarningMessage]):
         self._late: dict[int, str] = {}
 
     def _record(self, warning_message: warnings.WarningMessage) -> None:
-        module = _take_verdict()
+        module = _take_verdict(warning_message.message)
         if module is not None:
             self._late[id(warning_message)] = module
         self.append(warning_message)
@@ -159,18 +170,31 @@ def _route_recording_through_verdicts() -> None:
             warnings._showwarnmsg_impl = log._record  # type: ignore[attr-defined]
 
 
-def _pytest_receives_shown_warnings() -> bool:
-    showwarning = warnings.showwarning
-    if showwarning is not warnings._showwarning_orig:  # type: ignore[attr-defined]
-        return getattr(showwarning, "_pytest_error_later_sink", False)
-    if _CONTEXT_AWARE:
-        import _py_warnings
+class _ClearProbe:
+    __slots__ = ()
+    pattern = None
 
-        return warnings._showwarnmsg_impl is _py_warnings._showwarnmsg_impl and (  # type: ignore[attr-defined]
-            isinstance(warnings._get_context().log, _ContextSink)  # type: ignore[attr-defined]
-        )
-    sink = getattr(warnings._showwarnmsg_impl, "__func__", None)  # type: ignore[attr-defined]
-    return sink is LateWarningLog._record
+    def match(self, message: str) -> None:
+        _clear_verdict()
+
+    def __repr__(self) -> str:
+        return "<error_later clear>"
+
+
+class _MessageProbe:
+    __slots__ = ("_regex", "pattern")
+
+    def __init__(self, message: str) -> None:
+        #: Mirrors ``re.Pattern.pattern`` for code that inspects ``warnings.filters``.
+        self.pattern = message
+        self._regex = re.compile(message, re.IGNORECASE) if message else None
+
+    def match(self, message: str) -> object:
+        _verdict.message = message
+        return True if self._regex is None else self._regex.match(message)
+
+    def __repr__(self) -> str:
+        return f"<error_later message={self.pattern!r}>"
 
 
 class _WinProbe:
@@ -183,8 +207,8 @@ class _WinProbe:
 
     def match(self, module: str) -> object:
         matched = True if self._regex is None else self._regex.match(module)
-        if matched and _pytest_receives_shown_warnings():
-            _verdict.module = module
+        if matched:
+            _verdict.match = (module, _verdict.message)
         return matched
 
     def __repr__(self) -> str:
@@ -196,7 +220,7 @@ class _LossProbe:
     pattern = None
 
     def match(self, module: str) -> None:
-        _verdict.module = None
+        _clear_verdict()
 
     def __repr__(self) -> str:
         return "<error_later lost>"
@@ -212,10 +236,13 @@ def _install_error_later(
         if hasattr(warnings, "_get_filters")
         else warnings.filters,
     )
-    regex = re.compile(message, re.IGNORECASE) if message else None
+    message_probe = _MessageProbe(message)
     with getattr(warnings, "_lock", contextlib.nullcontext()):
         filters.insert(0, ("always", None, Warning, _LossProbe(), 0))
-        filters.insert(0, ("always", regex, category, _WinProbe(module), lineno))
+        filters.insert(
+            0, ("always", message_probe, category, _WinProbe(module), lineno)
+        )
+        filters.insert(0, ("always", _ClearProbe(), Warning, None, 0))
     warnings._filters_mutated()  # type: ignore[attr-defined]
     _route_recording_through_verdicts()
 
@@ -254,7 +281,7 @@ def collect_or_show(
         file: TextIO | None = None,
         line: str | None = None,
     ) -> None:
-        if _take_verdict() is not None and not state.closed:
+        if _take_verdict(message) is not None and not state.closed:
             warning_message = warnings.WarningMessage(
                 message, category, filename, lineno, file, line
             )

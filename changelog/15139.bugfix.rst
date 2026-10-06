@@ -1,0 +1,3 @@
+Fixed ``error_later`` warning filters being ignored when
+``warnings.showwarning`` is replaced by a wrapper that forwards to the original
+function.
