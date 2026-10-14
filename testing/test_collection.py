@@ -13,6 +13,8 @@ import textwrap
 
 from _pytest.compat import running_on_ci
 from _pytest.config import ExitCode
+from _pytest.ensemble import build_module
+from _pytest.ensemble import collect_tests
 from _pytest.fixtures import FixtureRequest
 from _pytest.main import _in_venv
 from _pytest.main import Session
@@ -39,23 +41,32 @@ class TestCollector:
         assert not issubclass(Collector, Item)
         assert not issubclass(Item, Collector)
 
-    def test_check_equality(self, pytester: Pytester) -> None:
-        modcol = pytester.getmodulecol(
-            """
-            def test_pass(): pass
-            def test_fail(): assert 0
-        """
-        )
-        fn1 = pytester.collect_by_name(modcol, "test_pass")
+    def test_check_equality(self, tmp_path: Path) -> None:
+        def test_pass() -> None:
+            pass
+
+        def test_fail() -> None:
+            assert 0
+
+        # ``Node`` defines no ``__eq__``, so equality is identity: looking a
+        # name up twice must yield the one node, as pytester's collection
+        # cache did for the original.
+        by_name = {
+            item.name: item
+            for item in collect_tests(test_pass, test_fail, rootpath=tmp_path)
+        }
+        fn1 = by_name["test_pass"]
+        fn2 = by_name["test_pass"]
+        modcol = fn1.parent
         assert isinstance(fn1, pytest.Function)
-        fn2 = pytester.collect_by_name(modcol, "test_pass")
         assert isinstance(fn2, pytest.Function)
+        assert isinstance(modcol, pytest.Module)
 
         assert fn1 == fn2
-        assert fn1 != modcol
+        assert fn1 != modcol  # type: ignore[comparison-overlap]
         assert hash(fn1) == hash(fn2)
 
-        fn3 = pytester.collect_by_name(modcol, "test_fail")
+        fn3 = by_name["test_fail"]
         assert isinstance(fn3, pytest.Function)
         assert not (fn1 == fn3)
         assert fn1 != fn3
@@ -63,12 +74,12 @@ class TestCollector:
         for fn in fn1, fn2, fn3:
             assert isinstance(fn, pytest.Function)
             assert fn != 3  # type: ignore[comparison-overlap]
-            assert fn != modcol
+            assert fn != modcol  # type: ignore[comparison-overlap]
             assert fn != [1, 2, 3]  # type: ignore[comparison-overlap]
             assert [1, 2, 3] != fn  # type: ignore[comparison-overlap]
-            assert modcol != fn
+            assert modcol != fn  # type: ignore[comparison-overlap]
 
-        assert pytester.collect_by_name(modcol, "doesnotexist") is None
+        assert "doesnotexist" not in by_name
 
     def test_getparent_and_accessors(self, pytester: Pytester) -> None:
         modcol = pytester.getmodulecol(
@@ -943,18 +954,17 @@ class TestNodeKeywords:
         assert item.keywords["kw"] == "method"
         assert len(item.keywords) == len(set(item.keywords))
 
-    def test_unpacked_marks_added_to_keywords(self, pytester: Pytester) -> None:
-        item = pytester.getitem(
-            """
-            import pytest
-            pytestmark = pytest.mark.foo
-            class TestClass:
-                pytestmark = pytest.mark.bar
-                def test_method(self): pass
-                test_method.pytestmark = pytest.mark.baz
-        """,
-            "test_method",
-        )
+    def test_unpacked_marks_added_to_keywords(self, tmp_path: Path) -> None:
+        class TestClass:
+            pytestmark = pytest.mark.bar
+
+            def test_method(self) -> None:
+                pass
+
+            test_method.pytestmark = pytest.mark.baz  # type: ignore[attr-defined]
+
+        module = build_module("test_marks", TestClass, pytestmark=pytest.mark.foo)
+        (item,) = collect_tests(module, rootpath=tmp_path)
         assert isinstance(item, pytest.Function)
         cls = item.getparent(pytest.Class)
         assert cls is not None
